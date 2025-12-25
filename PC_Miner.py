@@ -46,6 +46,10 @@ debug = "n"
 running_on_rpi = False
 configparser = ConfigParser()
 printlock = Lock()
+libducohasher = None
+fasthash_supported = False
+fasthash_import_error = None
+fasthash_warning_reported = False
 
 # Python <3.5 check
 f"Your Python version is too old. Duino-Coin Miner requires version 3.6 or above. Update your packages and try again"
@@ -143,6 +147,13 @@ except ModuleNotFoundError:
           + "If it fails, please manually execute "
           + "python3 -m pip install pypresence")
     install("pypresence")
+
+try:
+    import libducohasher
+    fasthash_supported = True
+except Exception as e:
+    fasthash_supported = False
+    fasthash_import_error = e
 
 
 class Settings:
@@ -350,50 +361,72 @@ class Algorithms:
     For more info about the implementation refer to the Duino whitepaper:
     https://github.com/revoxhere/duino-coin/blob/gh-pages/assets/whitepaper.pdf
     """
-    def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
-        try:
-            import libducohasher
-            fasthash_supported = True
-        except:
-            fasthash_supported = False
+    def _require_fast_hasher():
+        """
+        Ensures libducohasher is available before performing hashing.
+        Attempts automatic installation and exits with a clear warning
+        if the optimized backend cannot be loaded.
+        """
+        global fasthash_supported, fasthash_import_error, libducohasher, fasthash_warning_reported
+
+        if not fasthash_supported:
+            try:
+                import libducohasher as _libducohasher
+                libducohasher = _libducohasher
+                fasthash_supported = True
+                fasthash_import_error = None
+            except Exception as e:
+                fasthash_import_error = e
 
         if fasthash_supported:
-            time_start = time_ns()
+            return True
 
-            hasher = libducohasher.DUCOHasher(bytes(last_h, encoding='ascii'))
-            nonce = hasher.DUCOS1(
-                bytes(bytearray.fromhex(exp_h)), diff, int(eff))
+        if not fasthash_warning_reported:
+            fasthash_warning_reported = True
+            try:
+                pretty_print(
+                    "Fast libducohasher backend is required but missing "
+                    f"(platform: {osprocessor()}).",
+                    "warning", "sys0")
+            except Exception:
+                print("Fast libducohasher backend is required but missing.")
 
-            time_elapsed = time_ns() - time_start
-            if time_elapsed > 0:
-                hashrate = 1e9 * nonce / time_elapsed
-            else:
-                return [nonce,0]
+            if isinstance(fasthash_import_error, ModuleNotFoundError):
+                try:
+                    pretty_print(
+                        "Attempting to install libducohasher automatically...",
+                        "warning", "sys0")
+                except Exception:
+                    print("Attempting to install libducohasher automatically...")
+                install("libducohasher")
 
-            return [nonce, hashrate]
+            try:
+                pretty_print(
+                    "libducohasher could not be loaded. "
+                    "Please install a compatible build for your platform "
+                    "or follow the build instructions in README.md.",
+                    "error", "sys0")
+            except Exception:
+                print("libducohasher could not be loaded. Check README.md for instructions.")
+
+        sys.exit(1)
+
+    def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
+        Algorithms._require_fast_hasher()
+
+        time_start = time_ns()
+
+        hasher = libducohasher.DUCOHasher(bytes(last_h, encoding='ascii'))
+        nonce = hasher.DUCOS1(
+            bytes(bytearray.fromhex(exp_h)), diff, int(eff))
+
+        time_elapsed = time_ns() - time_start
+        if time_elapsed > 0:
+            hashrate = 1e9 * nonce / time_elapsed
         else:
-            time_start = time_ns()
-            base_hash = sha1(last_h.encode('ascii'))
+            return [nonce,0]
 
-            for nonce in range(100 * diff + 1):
-                temp_h = base_hash.copy()
-                temp_h.update(str(nonce).encode('ascii'))
-                d_res = temp_h.hexdigest()
-
-                if eff != 0:
-                    if nonce % 5000 == 0:
-                        sleep(eff / 100)
-
-                if d_res == exp_h:
-                    time_elapsed = time_ns() - time_start
-                    if time_elapsed > 0:
-                        hashrate = 1e9 * nonce / time_elapsed
-                    else:
-                        return [nonce,0]
-
-                    return [nonce, hashrate]
-
-            return [0, 0]
+        return [nonce, hashrate]
 
 
 class Client:
