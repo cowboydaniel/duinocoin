@@ -12,6 +12,7 @@ from socket import socket
 
 from multiprocessing import cpu_count, current_process
 from multiprocessing import Process, Manager, Semaphore
+from multiprocessing import Array, Value
 from threading import Thread, Lock
 from datetime import datetime
 from random import randint
@@ -586,6 +587,40 @@ def periodic_report(start_time, end_time, shares,
                  + raspi_iot_reading + "\n", "success")
 
 
+AGGREGATION_INTERVAL_SEC = 1.0
+AGGREGATION_INTERVAL_SHARES = 5
+FLUSH_INTERVAL_SEC = 1.0
+FLUSH_INTERVAL_SHARES = 3
+
+
+def aggregate_shared_stats(hashrate_array, accept_counts, reject_counts):
+    """
+    Aggregate totals from shared memory primitives.
+    """
+    return {
+        "timestamp": time(),
+        "hashrate": float(sum(hashrate_array)),
+        "accept": int(sum(accept_counts)),
+        "reject": int(sum(reject_counts)),
+    }
+
+
+def refresh_cached_totals(cache, shares_since_update,
+                          hashrate_array, accept_counts,
+                          reject_counts):
+    """
+    Return cached totals, refreshing them when enough
+    shares passed or when the cache is stale.
+    """
+    now_time = time()
+    if (cache is None
+        or shares_since_update >= AGGREGATION_INTERVAL_SHARES
+        or now_time - cache["timestamp"] >= AGGREGATION_INTERVAL_SEC):
+        return aggregate_shared_stats(
+            hashrate_array, accept_counts, reject_counts), 0
+    return cache, shares_since_update
+
+
 def calculate_uptime(start_time):
     """
     Returns seconds, minutes or hours passed since timestamp
@@ -1118,9 +1153,9 @@ class Miner:
                 sleep(10)
 
     def mine(id: int, user_settings: list,
-             blocks: int, pool: tuple,
-             accept: int, reject: int,
-             hashrate: list,
+             blocks, pool: tuple,
+             accept_counts, reject_counts,
+             hashrate_array,
              single_miner_id: str,
              print_queue):
         """
@@ -1136,9 +1171,15 @@ class Miner:
 
         last_report = time()
         r_shares, last_shares = 0, 0
+        local_accept, local_reject = 0, 0
+        shares_since_cache = 0
+        flush_shares = 0
+        last_flush = time()
+        cached_totals = aggregate_shared_stats(
+            hashrate_array, accept_counts, reject_counts)
         while True:
-            accept.value = 0
-            reject.value = 0
+            local_accept = 0
+            local_reject = 0
             try:
                 Miner.m_connect(id, pool)
                 while True:
@@ -1195,8 +1236,7 @@ class Miner:
                                 job[0], job[1], int(job[2]), eff)
                             computetime = time() - time_start
 
-                            hashrate[id] = result[1]
-                            total_hashrate = sum(hashrate.values())
+                            hashrate_array[id] = result[1]
                             prep_identifier = user_settings['identifier']
                             if running_on_rpi:
                                 if prep_identifier != "None":
@@ -1222,55 +1262,77 @@ class Miner:
                                 ping = (time() - time_start) * 1000
 
                                 if feedback[0] == "GOOD":
-                                    accept.value += 1
+                                    local_accept += 1
                                     share_print(id, "accept",
-                                                accept.value, reject.value,
-                                                hashrate[id],total_hashrate,
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
                                                 computetime, job[2], ping,
                                                 back_color,
                                                 print_queue=print_queue)
 
                                 elif feedback[0] == "BLOCK":
-                                    accept.value += 1
+                                    local_accept += 1
                                     blocks.value += 1
                                     share_print(id, "block",
-                                                accept.value, reject.value,
-                                                hashrate[id],total_hashrate,
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
                                                 computetime, job[2], ping,
                                                 back_color,
                                                 print_queue=print_queue)
 
                                 elif feedback[0] == "BAD":
-                                    reject.value += 1
+                                    local_reject += 1
                                     share_print(id, "reject",
-                                                accept.value, reject.value,
-                                                hashrate[id], total_hashrate,
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
                                                 computetime, job[2], ping,
                                                 back_color, feedback[1],
                                                 print_queue=print_queue)
 
-                                if accept.value % 100 == 0 and accept.value > 1:
+                                flush_shares += 1
+                                shares_since_cache += 1
+                                if (flush_shares >= FLUSH_INTERVAL_SHARES
+                                    or time() - last_flush >= FLUSH_INTERVAL_SEC):
+                                    accept_counts[id] = local_accept
+                                    reject_counts[id] = local_reject
+                                    last_flush = time()
+                                    flush_shares = 0
+
+                                cached_totals, shares_since_cache = refresh_cached_totals(
+                                    cached_totals, shares_since_cache,
+                                    hashrate_array, accept_counts,
+                                    reject_counts)
+
+                                if (cached_totals
+                                    and cached_totals["accept"] % 100 == 0
+                                    and cached_totals["accept"] > 1):
                                     pretty_print(
-                                        f"{get_string('surpassed')} {accept.value} {get_string('surpassed_shares')}",
+                                        f"{get_string('surpassed')} {cached_totals['accept']} {get_string('surpassed_shares')}",
                                         "success", "sys0", print_queue=print_queue)
 
-                                title(get_string('duco_python_miner') + str(Settings.VER)
-                                      + f') - {accept.value}/{(accept.value + reject.value)}'
-                                      + get_string('accepted_shares'))
+                                if cached_totals:
+                                    title(get_string('duco_python_miner') + str(Settings.VER)
+                                          + f') - {cached_totals["accept"]}/{(cached_totals["accept"] + cached_totals["reject"])}'
+                                          + get_string('accepted_shares'))
 
                                 if id == 0:
                                     end_time = time()
                                     elapsed_time = end_time - last_report
                                     if elapsed_time >= int(user_settings["report_sec"]):
-                                        r_shares = accept.value - last_shares
+                                        if cached_totals is None:
+                                            cached_totals, shares_since_cache = refresh_cached_totals(
+                                                cached_totals, shares_since_cache,
+                                                hashrate_array, accept_counts,
+                                                reject_counts)
+                                        r_shares = cached_totals["accept"] - last_shares
                                         uptime = calculate_uptime(
                                             mining_start_time)
                                         periodic_report(last_report, end_time,
                                                         r_shares, blocks.value,
-                                                        sum(hashrate.values()),
+                                                        cached_totals["hashrate"],
                                                         uptime)
                                         last_report = time()
-                                        last_shares = accept.value
+                                        last_shares = cached_totals["accept"]
                                 break
                             break
                     except Exception as e:
@@ -1302,11 +1364,13 @@ class Discord_rp:
     def update():
         while True:
             try:
-                total_hashrate = get_prefix("H/s", sum(hashrate.values()), 2)
+                cache = aggregate_shared_stats(
+                    hashrate_array, accept_counts, reject_counts)
+                total_hashrate = get_prefix("H/s", cache["hashrate"], 2)
                 RPC.update(details="Hashrate: " + str(total_hashrate),
                            start=mining_start_time,
-                           state=str(accept.value) + "/"
-                           + str(reject.value + accept.value)
+                           state=str(cache["accept"]) + "/"
+                           + str(cache["reject"] + cache["accept"])
                            + " accepted shares",
                            large_image="ducol",
                            large_text="Duino-Coin, "
@@ -1415,11 +1479,8 @@ if __name__ == "__main__":
     check_updates()
 
     cpu = cpuinfo.get_cpu_info()
-    accept = Manager().Value("i", 0)
-    reject = Manager().Value("i", 0)
-    blocks = Manager().Value("i", 0)
-    hashrate = Manager().dict()
-    print_queue = Manager().list()
+    manager = Manager()
+    print_queue = manager.list()
     Thread(target=print_queue_handler, args=[print_queue]).start()
 
     user_settings = Miner.load_cfg()
@@ -1488,13 +1549,18 @@ if __name__ == "__main__":
                      "warning")
         sleep(10)
 
+    hashrate_array = Array('d', threads, lock=False)
+    accept_counts = Array('L', threads, lock=False)
+    reject_counts = Array('L', threads, lock=False)
+    blocks = Value('L', 0)
+
     fastest_pool = Client.fetch_pool()
 
     for i in range(threads):
         p = Process(target=Miner.mine,
                     args=[i, user_settings, blocks,
-                          fastest_pool, accept, reject,
-                          hashrate, single_miner_id, 
+                          fastest_pool, accept_counts, reject_counts,
+                          hashrate_array, single_miner_id, 
                           print_queue])
         p_list.append(p)
         p.start()
