@@ -8,7 +8,7 @@ Duino-Coin Team & Community 2019-2024
 
 from time import time, sleep, strptime, ctime, time_ns
 from hashlib import sha1
-from socket import socket
+import socket
 
 from multiprocessing import cpu_count, current_process
 from multiprocessing import Process, Manager, Semaphore
@@ -162,6 +162,9 @@ class Settings:
     TEMP_FOLDER = "Temp"
 
     SOC_TIMEOUT = 10
+    LATENCY_SPIKE_MS = 2500
+    LATENCY_SAMPLE_SIZE = 50
+    LATENCY_REPORT_EVERY = 25
     REPORT_TIME = 300
     DONATE_LVL = 0
     RASPI_LEDS = "y"
@@ -402,9 +405,34 @@ class Client:
     """
     def connect(pool: tuple):
         global s
-        s = socket()
+        s = socket.socket()
         s.settimeout(Settings.SOC_TIMEOUT)
+        Client._tune_socket(s)
         s.connect((pool))
+
+    def _tune_socket(sock):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            debug_output(f"Unable to set TCP_NODELAY: {e}")
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP,
+                                socket.TCP_KEEPIDLE, 30)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP,
+                                socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP,
+                                socket.TCP_KEEPCNT, 3)
+            if hasattr(socket, "TCP_KEEPALIVE"):  # macOS/BSD
+                sock.setsockopt(socket.IPPROTO_TCP,
+                                socket.TCP_KEEPALIVE, 30)
+        except Exception as e:
+            debug_output(f"Unable to configure TCP keepalive: {e}")
 
     def send(msg: str):
         sent = s.sendall(str(msg).encode(Settings.ENCODING))
@@ -1136,9 +1164,15 @@ class Miner:
 
         last_report = time()
         r_shares, last_shares = 0, 0
+        share_latency_samples = []
+        job_latency_samples = []
+        shares_seen = 0
         while True:
             accept.value = 0
             reject.value = 0
+            share_latency_samples.clear()
+            job_latency_samples.clear()
+            shares_seen = 0
             try:
                 Miner.m_connect(id, pool)
                 while True:
@@ -1153,8 +1187,10 @@ class Miner:
                             # * instead of the degree symbol because nodes use basic encoding
                             raspi_iot_reading = f"CPU temperature:{get_rpi_temperature()}*C"
 
+                        connection_degraded = False
                         while True:
                             job_req = "JOB"
+                            job_request_time = time()
                             Client.send(job_req
                                         + Settings.SEPARATOR
                                         + str(user_settings["username"])
@@ -1166,6 +1202,27 @@ class Miner:
                                         + str(raspi_iot_reading))
 
                             job = Client.recv().split(Settings.SEPARATOR)
+                            job_latency_ms = (time() - job_request_time) * 1000
+                            job_latency_samples.append(job_latency_ms)
+                            if len(job_latency_samples) > Settings.LATENCY_SAMPLE_SIZE:
+                                job_latency_samples.pop(0)
+                            avg_job_latency = (sum(job_latency_samples)
+                                               / len(job_latency_samples))
+                            if job_latency_ms > Settings.LATENCY_SPIKE_MS or (
+                                avg_job_latency
+                                and job_latency_ms > avg_job_latency * 3
+                            ):
+                                pretty_print(
+                                    (f"Job fetch RTT spike ({int(job_latency_ms)}ms, "
+                                     f"avg {int(avg_job_latency)}ms), reconnecting "
+                                     "before mining"),
+                                    "warning", "net"+str(id), print_queue=print_queue)
+                                connection_degraded = True
+                                break
+                            if len(job_latency_samples) == 1:
+                                pretty_print(
+                                    f"Warm-up job RTT: {int(job_latency_ms)}ms",
+                                    "info", "net"+str(id), print_queue=print_queue)
                             if len(job) == 3:
                                 break
                             else:
@@ -1173,6 +1230,9 @@ class Miner:
                                     "Node message: " + str(job[1]),
                                     "warning", print_queue=print_queue)
                                 sleep(3)
+
+                        if connection_degraded:
+                            break
 
                         while True:
                             time_start = time()
@@ -1220,6 +1280,31 @@ class Miner:
                                 time_start = time()
                                 feedback = Client.recv().split(Settings.SEPARATOR)
                                 ping = (time() - time_start) * 1000
+                                share_latency_samples.append(ping)
+                                if len(share_latency_samples) > Settings.LATENCY_SAMPLE_SIZE:
+                                    share_latency_samples.pop(0)
+                                shares_seen += 1
+                                avg_share_latency = (sum(share_latency_samples)
+                                                     / len(share_latency_samples))
+                                avg_job_latency = (sum(job_latency_samples)
+                                                   / len(job_latency_samples))
+                                if shares_seen == 1 or shares_seen % Settings.LATENCY_REPORT_EVERY == 0:
+                                    pretty_print(
+                                        (f"Latency trend - job fetch: {int(job_latency_ms)}ms "
+                                         f"(avg {int(avg_job_latency)}ms), share submit: "
+                                         f"{int(ping)}ms (avg {int(avg_share_latency)}ms)"),
+                                        "info", "net"+str(id), print_queue=print_queue)
+
+                                if ping > Settings.LATENCY_SPIKE_MS or (
+                                    avg_share_latency
+                                    and ping > avg_share_latency * 3
+                                ):
+                                    pretty_print(
+                                        (f"Share RTT spike detected ({int(ping)}ms, "
+                                         f"avg {int(avg_share_latency)}ms) - reconnecting "
+                                         "to reduce idle time"),
+                                        "warning", "net"+str(id), print_queue=print_queue)
+                                    connection_degraded = True
 
                                 if feedback[0] == "GOOD":
                                     accept.value += 1
@@ -1249,6 +1334,8 @@ class Miner:
                                                 back_color, feedback[1],
                                                 print_queue=print_queue)
 
+                                if connection_degraded:
+                                    break
                                 if accept.value % 100 == 0 and accept.value > 1:
                                     pretty_print(
                                         f"{get_string('surpassed')} {accept.value} {get_string('surpassed_shares')}",
@@ -1272,6 +1359,8 @@ class Miner:
                                         last_report = time()
                                         last_shares = accept.value
                                 break
+                            break
+                        if connection_degraded:
                             break
                     except Exception as e:
                         pretty_print(get_string("error_while_mining")
