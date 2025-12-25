@@ -50,6 +50,7 @@ class Settings:
     VER = 4.3
     DATA_DIR = "Duino-Coin PC Miner 4.3"
     SETTINGS_FILE = "/Settings.cfg"
+    GPU_SETTINGS_FILE = "/GPU_Settings.cfg"
 
 
 class PoolClient:
@@ -107,13 +108,42 @@ def load_user_settings() -> Optional[ConfigParser]:
     return config
 
 
+def load_gpu_settings() -> Optional[ConfigParser]:
+    cfg_path = Path(Settings.DATA_DIR + Settings.GPU_SETTINGS_FILE)
+    if not cfg_path.is_file():
+        return None
+
+    config = ConfigParser()
+    config.read(cfg_path)
+    if "GPU Miner" not in config:
+        return None
+
+    return config
+
+
 def _require_hasher() -> libducohasher.DUCOHasher:
     if libducohasher:
         return libducohasher
 
     message = (
-        "libducohasher is required for hashing and is missing. "
-        "Install dependencies from requirements.txt."
+        "libducohasher is required for hashing and is missing. Install GPU miner "
+        "dependencies manually with `python3 -m pip install -r requirements.txt` "
+        "or `python3 -m pip install libducohasher`. Auto-install for GPU "
+        "dependencies is intentionally disabled because it depends on system "
+        "drivers."
+    )
+    raise SystemExit(message)
+
+
+def _require_opencl() -> None:
+    if cl is not None:
+        return
+
+    message = (
+        "PyOpenCL is required for the GPU backend and is not installed. Install it "
+        "manually with `python3 -m pip install pyopencl` (or "
+        "`python3 -m pip install -r requirements.txt`). GPU dependencies are not "
+        "auto-installed because they require vendor drivers and headers."
     )
     raise SystemExit(message)
 
@@ -270,7 +300,7 @@ class GpuHasher:
     }
     """
 
-    def __init__(self, device) -> None:
+    def __init__(self, device, work_size: Optional[int]) -> None:
         self.device = device
         self.context: Optional[cl.Context] = None
         self.queue: Optional[cl.CommandQueue] = None
@@ -278,6 +308,8 @@ class GpuHasher:
         self.max_group = None
         self.compute_units = None
         self.batch_size = None
+        self.work_group_size = None
+        self.requested_work_size = work_size
         self._setup_opencl(device)
         self._build_program()
 
@@ -292,7 +324,8 @@ class GpuHasher:
             self.queue = cl.CommandQueue(self.context, device)
             self.max_group = int(device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE))
             self.compute_units = int(device.get_info(cl.device_info.MAX_COMPUTE_UNITS))
-            self.batch_size = self.max_group * max(4, self.compute_units * 2)
+            self.work_group_size = self._resolve_work_group_size()
+            self.batch_size = self.work_group_size * max(4, self.compute_units * 2)
         except Exception as exc:  # pragma: no cover - device provisioning
             raise SystemExit(f"Failed to initialize GPU device: {exc}")
 
@@ -302,8 +335,25 @@ class GpuHasher:
         except Exception as exc:  # pragma: no cover - kernel compilation
             raise SystemExit(f"Failed to compile OpenCL kernel: {exc}")
 
+    def _resolve_work_group_size(self) -> int:
+        default_size = min(256, self.max_group)
+
+        if self.requested_work_size is None:
+            return default_size
+
+        if self.requested_work_size <= 0:
+            raise SystemExit("Work size must be a positive integer.")
+
+        if self.requested_work_size > self.max_group:
+            print(
+                f"Requested work size {self.requested_work_size} exceeds device limit "
+                f"{self.max_group}; using {self.max_group} instead.",
+                file=sys.stderr,
+            )
+        return min(self.requested_work_size, self.max_group)
+
     def _global_size(self, count: int) -> int:
-        group = min(256, self.max_group)
+        group = self.work_group_size
         groups = (count + group - 1) // group
         return groups * group
 
@@ -336,7 +386,6 @@ class GpuHasher:
         found_nonce = -1
         total_processed = 0
 
-        work_group = min(256, self.max_group)
         time_start = time_ns()
         while start_nonce < nonce_limit and found_nonce == -1:
             batch = min(self.batch_size, nonce_limit - start_nonce)
@@ -347,7 +396,7 @@ class GpuHasher:
             self.program.ducos1(
                 self.queue,
                 (global_size,),
-                (work_group,),
+                (self.work_group_size,),
                 last_buf,
                 np.uint8(len(last_bytes)),
                 np.uint32(start_nonce),
@@ -398,11 +447,7 @@ def gpu_worker(
 
 def discover_gpu_devices() -> Sequence:
     if cl is None:
-        message = (
-            "PyOpenCL is not available; install it to run the GPU miner. "
-            f"({_CL_IMPORT_ERROR})"
-        )
-        raise SystemExit(message)
+        _require_opencl()
 
     try:
         devices = [
@@ -415,8 +460,8 @@ def discover_gpu_devices() -> Sequence:
 
     if not devices:
         raise SystemExit(
-            "No GPU devices exposed via OpenCL. Install drivers or use --device "
-            "after enabling your GPU runtime."
+            "No GPU devices exposed via OpenCL. Install vendor GPU drivers/runtime, "
+            "ensure OpenCL ICDs are present, then retry."
         )
 
     return devices
@@ -431,9 +476,30 @@ def _decode_mining_key(raw_key: str) -> str:
         return raw_key
 
 
-def parse_args(config: Optional[ConfigParser]) -> argparse.Namespace:
+def parse_args(
+    config: Optional[ConfigParser], gpu_config: Optional[ConfigParser]
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Duino-Coin GPU miner")
-    parser.add_argument("--device", type=int, default=None, help="GPU index (default: first)")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("opencl",),
+        default=None,
+        help="Hashing backend to use (default: opencl)",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="GPU index (default: first or GPU_Settings.cfg value)",
+    )
+    parser.add_argument(
+        "--work-size",
+        type=int,
+        dest="work_size",
+        default=None,
+        help="Override kernel work group size (default: auto-detected)",
+    )
     parser.add_argument("--username", type=str, default=None, help="Wallet username override")
     parser.add_argument(
         "--mining-key",
@@ -464,6 +530,22 @@ def parse_args(config: Optional[ConfigParser]) -> argparse.Namespace:
         args.mining_key = args.mining_key or section.get("mining_key", "None")
         args.start_diff = args.start_diff or section.get("start_diff", "LOW")
         args.identifier = args.identifier or section.get("identifier", "GPU")
+
+    if gpu_config:
+        section = gpu_config["GPU Miner"]
+        args.backend = args.backend or section.get("backend", fallback=None)
+
+        device_fallback = section.get("device", fallback=None)
+        if args.device is None and device_fallback is not None:
+            args.device = section.getint("device")
+
+        work_size_fallback = section.get("work_size", fallback=None)
+        if args.work_size is None and work_size_fallback is not None:
+            args.work_size = section.getint("work_size")
+
+    args.backend = (args.backend or "opencl").lower()
+    if args.work_size is not None and args.work_size <= 0:
+        raise SystemExit("Work size must be a positive integer.")
 
     missing = [field for field in ("username",) if not getattr(args, field)]
     if missing:
@@ -521,8 +603,16 @@ def submit_result(
 
 
 def mine(args: argparse.Namespace) -> None:
+    if args.backend != "opencl":
+        raise SystemExit(
+            f"Unsupported backend '{args.backend}'. Supported backends: opencl."
+        )
+
+    _require_opencl()
+    _require_hasher()
+
     devices = discover_gpu_devices()
-    device_index = args.device or 0
+    device_index = 0 if args.device is None else args.device
     if device_index < 0 or device_index >= len(devices):
         raise SystemExit(
             f"Requested device index {device_index} is invalid. "
@@ -530,7 +620,7 @@ def mine(args: argparse.Namespace) -> None:
         )
 
     device = devices[device_index]
-    hasher = GpuHasher(device)
+    hasher = GpuHasher(device, args.work_size)
 
     print(
         f"Using GPU device: {device.name} (platform: {device.platform.name})",
@@ -623,7 +713,8 @@ def mine(args: argparse.Namespace) -> None:
 def main():
     colorama_init(autoreset=True)
     config = load_user_settings()
-    args = parse_args(config)
+    gpu_config = load_gpu_settings()
+    args = parse_args(config, gpu_config)
     mine(args)
 
 
