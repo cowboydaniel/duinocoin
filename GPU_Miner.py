@@ -14,13 +14,17 @@ import base64
 import socket
 import sys
 from configparser import ConfigParser
+from hashlib import sha1
 from pathlib import Path
 from random import randint
 from time import time, time_ns, sleep
 from typing import Optional, Sequence, Tuple
 
+import numpy as np
 import requests
 from colorama import Fore, Style, init as colorama_init
+from queue import Queue, Empty
+from threading import Event, Thread
 
 try:
     import pyopencl as cl
@@ -117,12 +121,165 @@ def _require_hasher() -> libducohasher.DUCOHasher:
 class GpuHasher:
     """GPU-first hashing wrapper with OpenCL device discovery."""
 
+    KERNEL_SOURCE = r"""
+    __kernel void ducos1(
+        __global const uchar* base_msg,
+        const uchar base_len,
+        const uint start_nonce,
+        const uint nonce_count,
+        __global const uchar* expected,
+        __global uint* found_nonce,
+        __global int* found_flag)
+    {
+        size_t gid = get_global_id(0);
+        if (gid >= nonce_count)
+            return;
+
+        if (atomic_or(found_flag, 0) != 0)
+            return;
+
+        uint nonce = start_nonce + (uint)gid;
+
+        uchar message[80];
+        for (uint i = 0; i < base_len; ++i) {
+            message[i] = base_msg[i];
+        }
+
+        uchar digits[10];
+        uint temp = nonce;
+        uchar digit_count = 0;
+        do {
+            digits[digit_count++] = (uchar)('0' + (temp % 10));
+            temp /= 10;
+        } while (temp > 0 && digit_count < 10);
+
+        for (uint i = 0; i < digit_count; ++i) {
+            message[base_len + i] = digits[digit_count - 1 - i];
+        }
+
+        uint msg_len = base_len + digit_count;
+        int length_index = 56;
+        int total_blocks = 1;
+        if ((msg_len + 1 + 8) > 64) {
+            length_index = 120;
+            total_blocks = 2;
+        }
+
+        uchar padded[128];
+        for (uint i = 0; i < 128; ++i) {
+            padded[i] = 0;
+        }
+
+        for (uint i = 0; i < msg_len; ++i) {
+            padded[i] = message[i];
+        }
+        padded[msg_len] = 0x80;
+
+        ulong bit_len = ((ulong)msg_len) * 8;
+        padded[length_index + 0] = (uchar)((bit_len >> 56) & 0xFF);
+        padded[length_index + 1] = (uchar)((bit_len >> 48) & 0xFF);
+        padded[length_index + 2] = (uchar)((bit_len >> 40) & 0xFF);
+        padded[length_index + 3] = (uchar)((bit_len >> 32) & 0xFF);
+        padded[length_index + 4] = (uchar)((bit_len >> 24) & 0xFF);
+        padded[length_index + 5] = (uchar)((bit_len >> 16) & 0xFF);
+        padded[length_index + 6] = (uchar)((bit_len >> 8) & 0xFF);
+        padded[length_index + 7] = (uchar)(bit_len & 0xFF);
+
+        uint h0 = 0x67452301;
+        uint h1 = 0xEFCDAB89;
+        uint h2 = 0x98BADCFE;
+        uint h3 = 0x10325476;
+        uint h4 = 0xC3D2E1F0;
+
+        for (int block = 0; block < total_blocks; ++block) {
+            uint w[80];
+            int offset = block * 64;
+            for (int t = 0; t < 16; ++t) {
+                int idx = offset + t * 4;
+                w[t] = ((uint)padded[idx] << 24) |
+                       ((uint)padded[idx + 1] << 16) |
+                       ((uint)padded[idx + 2] << 8) |
+                       ((uint)padded[idx + 3]);
+            }
+
+            for (int t = 16; t < 80; ++t) {
+                uint v = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+                w[t] = (v << 1) | (v >> 31);
+            }
+
+            uint a = h0;
+            uint b = h1;
+            uint c = h2;
+            uint d = h3;
+            uint e = h4;
+
+            for (int t = 0; t < 80; ++t) {
+                uint f;
+                uint k;
+                if (t < 20) {
+                    f = (b & c) | ((~b) & d);
+                    k = 0x5A827999;
+                } else if (t < 40) {
+                    f = b ^ c ^ d;
+                    k = 0x6ED9EBA1;
+                } else if (t < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 0x8F1BBCDC;
+                } else {
+                    f = b ^ c ^ d;
+                    k = 0xCA62C1D6;
+                }
+
+                uint tempv = ((a << 5) | (a >> 27)) + f + e + k + w[t];
+                e = d;
+                d = c;
+                c = (b << 30) | (b >> 2);
+                b = a;
+                a = tempv;
+            }
+
+            h0 += a;
+            h1 += b;
+            h2 += c;
+            h3 += d;
+            h4 += e;
+        }
+
+        uchar digest[20];
+        uint hs[5] = {h0, h1, h2, h3, h4};
+        for (int i = 0; i < 5; ++i) {
+            digest[i * 4 + 0] = (uchar)((hs[i] >> 24) & 0xFF);
+            digest[i * 4 + 1] = (uchar)((hs[i] >> 16) & 0xFF);
+            digest[i * 4 + 2] = (uchar)((hs[i] >> 8) & 0xFF);
+            digest[i * 4 + 3] = (uchar)(hs[i] & 0xFF);
+        }
+
+        uchar match = 1;
+        for (int i = 0; i < 20; ++i) {
+            if (digest[i] != expected[i]) {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match) {
+            if (atomic_cmpxchg(found_flag, 0, 1) == 0) {
+                found_nonce[0] = nonce;
+            }
+        }
+    }
+    """
+
     def __init__(self, device) -> None:
         self.device = device
-        self.context = None
-        self.queue = None
+        self.context: Optional[cl.Context] = None
+        self.queue: Optional[cl.CommandQueue] = None
+        self.program: Optional[cl.Program] = None
+        self.max_group = None
+        self.compute_units = None
+        self.batch_size = None
         self._setup_opencl(device)
-        self._hasher = _require_hasher()
+        self._build_program()
 
     def _setup_opencl(self, device) -> None:
         if cl is None:
@@ -133,25 +290,110 @@ class GpuHasher:
         try:
             self.context = cl.Context(devices=[device])
             self.queue = cl.CommandQueue(self.context, device)
+            self.max_group = int(device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE))
+            self.compute_units = int(device.get_info(cl.device_info.MAX_COMPUTE_UNITS))
+            self.batch_size = self.max_group * max(4, self.compute_units * 2)
         except Exception as exc:  # pragma: no cover - device provisioning
             raise SystemExit(f"Failed to initialize GPU device: {exc}")
 
-    def solve_job(self, last_hash: str, expected: str, difficulty: int) -> Tuple[int, float]:
-        """
-        Solve a DUCOS1 job. The hashing itself reuses the optimized
-        libducohasher backend to preserve correctness; GPU discovery controls
-        whether this miner runs at all.
-        """
+    def _build_program(self) -> None:
+        try:
+            self.program = cl.Program(self.context, self.KERNEL_SOURCE).build()
+        except Exception as exc:  # pragma: no cover - kernel compilation
+            raise SystemExit(f"Failed to compile OpenCL kernel: {exc}")
 
+    def _global_size(self, count: int) -> int:
+        group = min(256, self.max_group)
+        groups = (count + group - 1) // group
+        return groups * group
+
+    def solve_job(self, last_hash: str, expected: str, difficulty: int) -> Tuple[int, float]:
         if not isinstance(expected, str):
             expected = str(expected)
 
+        mf = cl.mem_flags
+        try:
+            last_bytes = bytes(last_hash, encoding="ascii")
+            expected_bytes = bytes(bytearray.fromhex(expected))
+        except Exception:
+            raise SystemExit("Invalid job payload received; cannot encode hashes.")
+
+        if len(last_bytes) > 70:
+            raise SystemExit("Job payload too large for GPU kernel input buffer.")
+
+        if len(expected_bytes) != 20:
+            raise SystemExit(f"Expected hash must be 20 bytes (got {len(expected_bytes)})")
+
+        last_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=last_bytes)
+        expected_buf = cl.Buffer(
+            self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=expected_bytes
+        )
+        found_nonce_buf = cl.Buffer(self.context, mf.WRITE_ONLY, size=4)
+        found_flag_buf = cl.Buffer(self.context, mf.READ_WRITE, size=4)
+
+        nonce_limit = int(difficulty) * 100 + 1
+        start_nonce = 0
+        found_nonce = -1
+        total_processed = 0
+
+        work_group = min(256, self.max_group)
         time_start = time_ns()
-        hasher = self._hasher.DUCOHasher(bytes(last_hash, encoding="ascii"))
-        nonce = hasher.DUCOS1(bytes(bytearray.fromhex(expected)), difficulty, 0)
+        while start_nonce < nonce_limit and found_nonce == -1:
+            batch = min(self.batch_size, nonce_limit - start_nonce)
+            global_size = self._global_size(batch)
+            nonce_count = batch
+
+            cl.enqueue_fill_buffer(self.queue, found_flag_buf, b"\x00\x00\x00\x00", 0, 4)
+            self.program.ducos1(
+                self.queue,
+                (global_size,),
+                (work_group,),
+                last_buf,
+                np.uint8(len(last_bytes)),
+                np.uint32(start_nonce),
+                np.uint32(nonce_count),
+                expected_buf,
+                found_nonce_buf,
+                found_flag_buf,
+            )
+            self.queue.finish()
+
+            flag_host = np.zeros(1, dtype=np.int32)
+            cl.enqueue_copy(self.queue, flag_host, found_flag_buf)
+            found = int(flag_host[0]) != 0
+            if found:
+                nonce_host = np.zeros(1, dtype=np.uint32)
+                cl.enqueue_copy(self.queue, nonce_host, found_nonce_buf)
+                found_nonce = int(nonce_host[0])
+                total_processed = found_nonce + 1
+                break
+
+            start_nonce += batch
+            total_processed = start_nonce
+
         elapsed = time_ns() - time_start
-        hashrate = (1e9 * nonce / elapsed) if elapsed else 0.0
-        return nonce, hashrate
+        hashrate = (1e9 * total_processed / elapsed) if elapsed else 0.0
+        return found_nonce if found_nonce != -1 else nonce_limit, hashrate
+
+
+def gpu_worker(
+    hasher: GpuHasher,
+    job_queue: Queue,
+    result_queue: Queue,
+    stop_event: Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            job = job_queue.get(timeout=1)
+        except Empty:
+            continue
+
+        last_hash, expected, difficulty = job
+        try:
+            nonce, hashrate = hasher.solve_job(last_hash, expected, difficulty)
+            result_queue.put((job, nonce, hashrate, None))
+        except Exception as exc:  # pragma: no cover - worker safety
+            result_queue.put((job, None, 0.0, exc))
 
 
 def discover_gpu_devices() -> Sequence:
@@ -295,6 +537,16 @@ def mine(args: argparse.Namespace) -> None:
         file=sys.stderr,
     )
 
+    job_queue: Queue = Queue(maxsize=8)
+    result_queue: Queue = Queue(maxsize=8)
+    stop_event = Event()
+    worker = Thread(
+        target=gpu_worker,
+        args=(hasher, job_queue, result_queue, stop_event),
+        daemon=True,
+    )
+    worker.start()
+
     mining_key = _decode_mining_key(args.mining_key or "None")
     single_miner_id = randint(0, 2811)
 
@@ -307,7 +559,35 @@ def mine(args: argparse.Namespace) -> None:
 
                 while True:
                     job = request_job(sock, args.username, args.start_diff or "LOW", mining_key)
-                    nonce, hashrate = hasher.solve_job(*job)
+                    try:
+                        job_queue.put(job, timeout=Settings.SOC_TIMEOUT)
+                    except Exception:
+                        print("GPU queue backpressure encountered; retrying", file=sys.stderr)
+                        continue
+
+                    try:
+                        job_result = result_queue.get(timeout=Settings.SOC_TIMEOUT * 2)
+                    except Empty:
+                        print("GPU worker timeout waiting for result", file=sys.stderr)
+                        continue
+
+                    (last_hash, expected, difficulty), nonce, hashrate, error = job_result
+                    expected_hex = expected.lower()
+
+                    if error:
+                        print(f"GPU worker failed: {error}", file=sys.stderr)
+                        continue
+
+                    candidate_hash = sha1(f"{last_hash}{nonce}".encode("ascii")).hexdigest()
+                    if candidate_hash != expected_hex:
+                        print(
+                            Style.BRIGHT
+                            + Fore.YELLOW
+                            + f"Discarded invalid share from GPU (nonce={nonce})",
+                            file=sys.stderr,
+                        )
+                        continue
+
                     feedback = submit_result(
                         sock,
                         nonce,
@@ -318,9 +598,17 @@ def mine(args: argparse.Namespace) -> None:
                     parts = feedback.split(Settings.SEPARATOR)
                     status = parts[0] if parts else "UNKNOWN"
                     if status == "GOOD":
-                        print(Style.BRIGHT + Fore.GREEN + f"Share accepted at {hashrate:.2f} H/s")
+                        print(
+                            Style.BRIGHT
+                            + Fore.GREEN
+                            + f"Share accepted by {device.name} at {hashrate:.2f} H/s"
+                        )
                     elif status == "BLOCK":
-                        print(Style.BRIGHT + Fore.CYAN + "Block found!")
+                        print(
+                            Style.BRIGHT
+                            + Fore.CYAN
+                            + f"Block found! {device.name} {hashrate:.2f} H/s"
+                        )
                     else:
                         print(
                             Style.BRIGHT

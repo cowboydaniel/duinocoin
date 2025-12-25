@@ -6,3 +6,4 @@ pypresence
 psutil
 libducohasher
 pyopencl
+numpy
