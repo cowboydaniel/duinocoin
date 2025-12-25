@@ -1,0 +1,6 @@
+py-cpuinfo
+colorama
+requests
+pyserial
+pypresence
+psutil
