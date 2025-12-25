@@ -13,7 +13,9 @@ from socket import socket
 from multiprocessing import cpu_count, current_process
 from multiprocessing import Process, Manager, Semaphore
 from multiprocessing import Array, Value
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
+from queue import Queue, Empty
+from collections import defaultdict
 from datetime import datetime
 from random import randint
 
@@ -589,8 +591,27 @@ def get_rpi_temperature():
     return round(int(output) / 1000, 2)
 
 
+def get_cpu_temperature():
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for _, entries in temps.items():
+                for entry in entries:
+                    if entry.current:
+                        return round(entry.current, 2)
+    except Exception as e:
+        debug_output(f"Temperature read error: {e}")
+    if running_on_rpi:
+        try:
+            return get_rpi_temperature()
+        except Exception:
+            pass
+    return None
+
+
 def periodic_report(start_time, end_time, shares,
-                    blocks, hashrate, uptime):
+                    blocks, hashrate, uptime,
+                    intensity=None):
     """
     Displays nicely formated uptime stats
     """
@@ -617,6 +638,7 @@ def periodic_report(start_time, end_time, shares,
                  + get_string("report_body6")
                  + get_string("total_mining_time")
                  + str(uptime)
+                 + (f" | eff {intensity}%" if intensity is not None else "")
                  + raspi_iot_reading + "\n", "success")
 
 
@@ -624,6 +646,8 @@ AGGREGATION_INTERVAL_SEC = 1.0
 AGGREGATION_INTERVAL_SHARES = 5
 FLUSH_INTERVAL_SEC = 1.0
 FLUSH_INTERVAL_SHARES = 3
+PERFORMANCE_LOG_INTERVAL_SHARES = 25
+PERFORMANCE_LOG_INTERVAL_SEC = 15.0
 
 
 def aggregate_shared_stats(hashrate_array, accept_counts, reject_counts):
@@ -717,9 +741,24 @@ def share_print(id, type,
     Produces nicely formatted CLI output for shares:
     HH:MM:S |cpuN| ⛏ Accepted 0/0 (100%) ∙ 0.0s ∙ 0 kH/s ⚙ diff 0 k ∙ ping 0ms
     """
-    thread_hashrate = get_prefix("H/s", thread_hashrate, 2)
-    total_hashrate = get_prefix("H/s", total_hashrate, 1)
-    diff = get_prefix("", int(diff), 0)
+    if not hasattr(share_print, "_perf_state"):
+        share_print._perf_state = defaultdict(lambda: {"last_time": 0})
+    perf_mode = False
+    try:
+        perf_mode = user_settings.get("performance_log", "n") == "y"
+    except Exception:
+        perf_mode = False
+
+    share_total = accept + reject
+    now_time = time()
+    should_print = True
+    if perf_mode:
+        state = share_print._perf_state[id]
+        should_print = (
+            type != "accept"
+            or share_total % PERFORMANCE_LOG_INTERVAL_SHARES == 0
+            or (now_time - state["last_time"]) >= PERFORMANCE_LOG_INTERVAL_SEC
+        )
 
     def _blink_builtin(led="green"):
         if led == "green":
@@ -734,7 +773,7 @@ def share_print(id, type,
             sleep(0.1)
             os.system(
                 'echo 0 | sudo tee /sys/class/leds/led1/brightness >/dev/null 2>&1')
-    
+
     if type == "accept":
         if running_on_rpi and user_settings["raspi_leds"] == "y":
             _blink_builtin()
@@ -753,6 +792,23 @@ def share_print(id, type,
             share_str += f"{Style.NORMAL}({reject_cause}) "
         fg_color = Fore.RED
 
+    if not should_print:
+        return
+
+    share_print._perf_state[id]["last_time"] = now_time
+
+    if perf_mode:
+        compact_msg = (f"{datetime.now().strftime('%H:%M:%S')} cpu{id} "
+                       f"{share_str.strip()} {accept}/{share_total} "
+                       f"{int(thread_hashrate)}H/s "
+                       f"ping {int(ping)}ms eff {user_settings.get('intensity', '?')}%")
+        print_queue.append(compact_msg)
+        return
+
+    thread_hashrate = get_prefix("H/s", thread_hashrate, 2)
+    total_hashrate = get_prefix("H/s", total_hashrate, 1)
+    diff = get_prefix("", int(diff), 0)
+    
     print_queue.append(Fore.WHITE + datetime.now().strftime(Style.DIM + "%H:%M:%S ")
               + Style.RESET_ALL + Fore.WHITE + Style.BRIGHT + back_color
               + f" cpu{id} " + Back.RESET + fg_color + Settings.PICK
@@ -1119,6 +1175,12 @@ class Miner:
             if float(donation_level) < int(0):
                 donation_level = 0
 
+            performance_log = input(Style.NORMAL
+                                     + "Enable performance logging mode (less verbose)? [y/N]: "
+                                     + Style.BRIGHT)
+            if performance_log.lower() not in ("y", "n"):
+                performance_log = "n"
+
             configparser["PC Miner"] = {
                 "username":      username,
                 "mining_key":    mining_key,
@@ -1133,7 +1195,8 @@ class Miner:
                 "report_sec":    Settings.REPORT_TIME,
                 "raspi_leds":    Settings.RASPI_LEDS,
                 "raspi_cpu_iot": Settings.RASPI_CPU_IOT,
-                "discord_rp":    "y"}
+                "discord_rp":    "y",
+                "performance_log": performance_log.lower()}
 
             with open(Settings.DATA_DIR + Settings.SETTINGS_FILE,
                       "w") as configfile:
@@ -1142,6 +1205,8 @@ class Miner:
 
         configparser.read(Settings.DATA_DIR
                           + Settings.SETTINGS_FILE)
+        if "performance_log" not in configparser["PC Miner"]:
+            configparser["PC Miner"]["performance_log"] = "n"
         return configparser["PC Miner"]
 
     def m_connect(id, pool):
@@ -1210,174 +1275,300 @@ class Miner:
         last_flush = time()
         cached_totals = aggregate_shared_stats(
             hashrate_array, accept_counts, reject_counts)
+
+        # Adaptive tuning and pool selection state
+        current_intensity = int(user_settings["intensity"])
+        tuning_snapshot = {"accept": 0, "reject": 0, "time": time()}
+        recent_pings = []
+        pool_metrics = defaultdict(lambda: {"latency": 0, "errors": 0, "last": time()})
+        current_pool = pool
+        last_pool_switch = time()
+
+        # Prefetcher settings
+        PREFETCH_LIMIT = 2
+        PREFETCH_BACKOFF = 1.0
+
+        def _efficiency_from_intensity(intensity: int):
+            if 99 > intensity >= 90:
+                return 0.005
+            elif 90 > intensity >= 70:
+                return 0.1
+            elif 70 > intensity >= 50:
+                return 0.8
+            elif 50 > intensity >= 30:
+                return 1.8
+            elif 30 > intensity >= 1:
+                return 3
+            return 0
+
+        def _update_pool_latency(pool_key, ping):
+            existing = pool_metrics[pool_key]["latency"]
+            if existing == 0:
+                pool_metrics[pool_key]["latency"] = ping
+            else:
+                pool_metrics[pool_key]["latency"] = (existing * 0.7) + (ping * 0.3)
+            pool_metrics[pool_key]["last"] = time()
+
+        def _choose_best_pool():
+            # Prefer the cached pool with the lowest latency
+            best_pool = current_pool
+            best_ping = pool_metrics[current_pool]["latency"] if current_pool in pool_metrics else float("inf")
+            for pool_key, stats in pool_metrics.items():
+                if stats["latency"] != 0 and stats["latency"] < best_ping:
+                    best_pool = pool_key
+                    best_ping = stats["latency"]
+            return best_pool
+
+        def _should_switch_pool(avg_ping):
+            time_since_switch = time() - last_pool_switch
+            if avg_ping > 800 and time_since_switch > 30:
+                return True
+            if pool_metrics[current_pool]["errors"] >= 3 and time_since_switch > 10:
+                return True
+            return False
+
+        def _tune_intensity():
+            nonlocal current_intensity, tuning_snapshot
+            now_time = time()
+            elapsed = now_time - tuning_snapshot["time"]
+            if elapsed < 45:
+                return
+            accept_delta = local_accept - tuning_snapshot["accept"]
+            reject_delta = local_reject - tuning_snapshot["reject"]
+            total_delta = accept_delta + reject_delta
+            reject_ratio = (reject_delta / total_delta) if total_delta > 0 else 0
+
+            avg_ping = sum(recent_pings) / len(recent_pings) if recent_pings else 0
+            temp = get_cpu_temperature()
+            too_hot = temp is not None and temp > 80
+
+            if reject_ratio > 0.1 or avg_ping > 850 or too_hot:
+                current_intensity = max(5, current_intensity - 5)
+            elif reject_ratio < 0.03 and avg_ping < 500 and not too_hot and accept_delta > 0:
+                current_intensity = min(100, current_intensity + 5)
+
+            user_settings["intensity"] = str(current_intensity)
+            tuning_snapshot = {
+                "accept": local_accept,
+                "reject": local_reject,
+                "time": now_time
+            }
+
+        def _update_title():
+            if cached_totals:
+                title(get_string('duco_python_miner') + str(Settings.VER)
+                      + f') - {cached_totals["accept"]}/{(cached_totals["accept"] + cached_totals["reject"])}'
+                      + get_string('accepted_shares')
+                      + f" | eff {current_intensity}%")
+
         while True:
             local_accept = 0
             local_reject = 0
+            job_queue = Queue(maxsize=PREFETCH_LIMIT)
+            prefetch_stop = Event()
+            socket_lock = Lock()
+            prefetch_error = {"err": None}
+            prefetch_thread = None
             try:
-                Miner.m_connect(id, pool)
-                while True:
-                    try:
-                        if user_settings["mining_key"] != "None":   
-                            key = b64.b64decode(user_settings["mining_key"]).decode('utf-8')    
-                        else:   
-                            key = user_settings["mining_key"]
+                Miner.m_connect(id, current_pool)
 
-                        raspi_iot_reading = ""
-                        if user_settings["raspi_cpu_iot"] == "y" and running_on_rpi:
-                            # * instead of the degree symbol because nodes use basic encoding
-                            raspi_iot_reading = f"CPU temperature:{get_rpi_temperature()}*C"
+                def job_prefetcher():
+                    nonlocal prefetch_error
+                    while not prefetch_stop.is_set():
+                        if job_queue.full():
+                            sleep(0.05)
+                            continue
+                        try:
+                            if user_settings["mining_key"] != "None":
+                                key = b64.b64decode(user_settings["mining_key"]).decode('utf-8')
+                            else:
+                                key = user_settings["mining_key"]
 
-                        while True:
-                            job_req = "JOB"
-                            Client.send(job_req
-                                        + Settings.SEPARATOR
-                                        + str(user_settings["username"])
-                                        + Settings.SEPARATOR
-                                        + str(user_settings["start_diff"])
-                                        + Settings.SEPARATOR
-                                        + str(key)
-                                        + Settings.SEPARATOR
-                                        + str(raspi_iot_reading))
+                            raspi_iot_reading = ""
+                            if user_settings["raspi_cpu_iot"] == "y" and running_on_rpi:
+                                # * instead of the degree symbol because nodes use basic encoding
+                                raspi_iot_reading = f"CPU temperature:{get_rpi_temperature()}*C"
 
-                            job = Client.recv().split(Settings.SEPARATOR)
+                            with socket_lock:
+                                Client.send("JOB"
+                                            + Settings.SEPARATOR
+                                            + str(user_settings["username"])
+                                            + Settings.SEPARATOR
+                                            + str(user_settings["start_diff"])
+                                            + Settings.SEPARATOR
+                                            + str(key)
+                                            + Settings.SEPARATOR
+                                            + str(raspi_iot_reading))
+
+                                job = Client.recv().split(Settings.SEPARATOR)
                             if len(job) == 3:
-                                break
+                                job_queue.put(job)
                             else:
                                 pretty_print(
                                     "Node message: " + str(job[1]),
                                     "warning", print_queue=print_queue)
-                                sleep(3)
+                                sleep(PREFETCH_BACKOFF)
+                        except Exception as e:
+                            prefetch_error["err"] = e
+                            prefetch_stop.set()
+                            break
 
-                        while True:
-                            time_start = time()
-                            back_color = Back.YELLOW
+                prefetch_thread = Thread(target=job_prefetcher, daemon=True)
+                prefetch_thread.start()
 
-                            eff = 0
-                            eff_setting = int(user_settings["intensity"])
-                            if 99 > eff_setting >= 90:
-                                eff = 0.005
-                            elif 90 > eff_setting >= 70:
-                                eff = 0.1
-                            elif 70 > eff_setting >= 50:
-                                eff = 0.8
-                            elif 50 > eff_setting >= 30:
-                                eff = 1.8
-                            elif 30 > eff_setting >= 1:
-                                eff = 3
+                while not prefetch_stop.is_set():
+                    try:
+                        job = job_queue.get(timeout=Settings.SOC_TIMEOUT)
+                    except Empty:
+                        if prefetch_error["err"]:
+                            raise prefetch_error["err"]
+                        continue
 
-                            result = Algorithms.DUCOS1(
-                                job[0], job[1], int(job[2]), eff)
-                            computetime = time() - time_start
+                    time_start = time()
+                    back_color = Back.YELLOW
+                    eff = _efficiency_from_intensity(int(current_intensity))
 
-                            hashrate_array[id] = result[1]
-                            prep_identifier = user_settings['identifier']
-                            if running_on_rpi:
-                                if prep_identifier != "None":
-                                    prep_identifier += " - RPi"
-                                else:
-                                    prep_identifier = "Raspberry Pi"
-                                    
-                            while True:
-                                Client.send(f"{result[0]}"
-                                            + Settings.SEPARATOR
-                                            + f"{result[1]}"
-                                            + Settings.SEPARATOR
-                                            + "Official PC Miner"
-                                            + f" {Settings.VER}"
-                                            + Settings.SEPARATOR
-                                            + f"{prep_identifier}"
-                                            + Settings.SEPARATOR
-                                            + Settings.SEPARATOR
-                                            + f"{single_miner_id}")
+                    result = Algorithms.DUCOS1(
+                        job[0], job[1], int(job[2]), eff)
+                    computetime = time() - time_start
 
-                                time_start = time()
-                                feedback = Client.recv().split(Settings.SEPARATOR)
-                                ping = (time() - time_start) * 1000
+                    hashrate_array[id] = result[1]
+                    prep_identifier = user_settings['identifier']
+                    if running_on_rpi:
+                        if prep_identifier != "None":
+                            prep_identifier += " - RPi"
+                        else:
+                            prep_identifier = "Raspberry Pi"
 
-                                if feedback[0] == "GOOD":
-                                    local_accept += 1
-                                    share_print(id, "accept",
-                                                local_accept, local_reject,
-                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                                computetime, job[2], ping,
-                                                back_color,
-                                                print_queue=print_queue)
+                    with socket_lock:
+                        Client.send(f"{result[0]}"
+                                    + Settings.SEPARATOR
+                                    + f"{result[1]}"
+                                    + Settings.SEPARATOR
+                                    + "Official PC Miner"
+                                    + f" {Settings.VER}"
+                                    + Settings.SEPARATOR
+                                    + f"{prep_identifier}"
+                                    + Settings.SEPARATOR
+                                    + Settings.SEPARATOR
+                                    + f"{single_miner_id}")
 
-                                elif feedback[0] == "BLOCK":
-                                    local_accept += 1
-                                    blocks.value += 1
-                                    share_print(id, "block",
-                                                local_accept, local_reject,
-                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                                computetime, job[2], ping,
-                                                back_color,
-                                                print_queue=print_queue)
+                        time_start = time()
+                        feedback = Client.recv().split(Settings.SEPARATOR)
+                    ping = (time() - time_start) * 1000
+                    recent_pings.append(ping)
+                    if len(recent_pings) > 30:
+                        recent_pings.pop(0)
+                    _update_pool_latency(current_pool, ping)
 
-                                elif feedback[0] == "BAD":
-                                    local_reject += 1
-                                    share_print(id, "reject",
-                                                local_accept, local_reject,
-                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                                computetime, job[2], ping,
-                                                back_color, feedback[1],
-                                                print_queue=print_queue)
+                    if feedback[0] == "GOOD":
+                        local_accept += 1
+                        share_print(id, "accept",
+                                    local_accept, local_reject,
+                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                    computetime, job[2], ping,
+                                    back_color,
+                                    print_queue=print_queue)
 
-                                flush_shares += 1
-                                shares_since_cache += 1
-                                if (flush_shares >= FLUSH_INTERVAL_SHARES
-                                    or time() - last_flush >= FLUSH_INTERVAL_SEC):
-                                    accept_counts[id] = local_accept
-                                    reject_counts[id] = local_reject
-                                    last_flush = time()
-                                    flush_shares = 0
+                    elif feedback[0] == "BLOCK":
+                        local_accept += 1
+                        blocks.value += 1
+                        share_print(id, "block",
+                                    local_accept, local_reject,
+                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                    computetime, job[2], ping,
+                                    back_color,
+                                    print_queue=print_queue)
 
+                    elif feedback[0] == "BAD":
+                        local_reject += 1
+                        pool_metrics[current_pool]["errors"] += 1
+                        share_print(id, "reject",
+                                    local_accept, local_reject,
+                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                    computetime, job[2], ping,
+                                    back_color, feedback[1],
+                                    print_queue=print_queue)
+
+                    flush_shares += 1
+                    shares_since_cache += 1
+                    if (flush_shares >= FLUSH_INTERVAL_SHARES
+                        or time() - last_flush >= FLUSH_INTERVAL_SEC):
+                        accept_counts[id] = local_accept
+                        reject_counts[id] = local_reject
+                        last_flush = time()
+                        flush_shares = 0
+
+                    cached_totals, shares_since_cache = refresh_cached_totals(
+                        cached_totals, shares_since_cache,
+                        hashrate_array, accept_counts,
+                        reject_counts)
+
+                    if (cached_totals
+                        and cached_totals["accept"] % 100 == 0
+                        and cached_totals["accept"] > 1):
+                        pretty_print(
+                            f"{get_string('surpassed')} {cached_totals['accept']} {get_string('surpassed_shares')}",
+                            "success", "sys0", print_queue=print_queue)
+
+                    _update_title()
+                    _tune_intensity()
+
+                    if id == 0:
+                        end_time = time()
+                        elapsed_time = end_time - last_report
+                        if elapsed_time >= int(user_settings["report_sec"]):
+                            if cached_totals is None:
                                 cached_totals, shares_since_cache = refresh_cached_totals(
                                     cached_totals, shares_since_cache,
                                     hashrate_array, accept_counts,
                                     reject_counts)
+                            r_shares = cached_totals["accept"] - last_shares
+                            uptime = calculate_uptime(
+                                mining_start_time)
+                            periodic_report(last_report, end_time,
+                                            r_shares, blocks.value,
+                                            cached_totals["hashrate"],
+                                            uptime,
+                                            current_intensity)
+                            last_report = time()
+                            last_shares = cached_totals["accept"]
 
-                                if (cached_totals
-                                    and cached_totals["accept"] % 100 == 0
-                                    and cached_totals["accept"] > 1):
-                                    pretty_print(
-                                        f"{get_string('surpassed')} {cached_totals['accept']} {get_string('surpassed_shares')}",
-                                        "success", "sys0", print_queue=print_queue)
-
-                                if cached_totals:
-                                    title(get_string('duco_python_miner') + str(Settings.VER)
-                                          + f') - {cached_totals["accept"]}/{(cached_totals["accept"] + cached_totals["reject"])}'
-                                          + get_string('accepted_shares'))
-
-                                if id == 0:
-                                    end_time = time()
-                                    elapsed_time = end_time - last_report
-                                    if elapsed_time >= int(user_settings["report_sec"]):
-                                        if cached_totals is None:
-                                            cached_totals, shares_since_cache = refresh_cached_totals(
-                                                cached_totals, shares_since_cache,
-                                                hashrate_array, accept_counts,
-                                                reject_counts)
-                                        r_shares = cached_totals["accept"] - last_shares
-                                        uptime = calculate_uptime(
-                                            mining_start_time)
-                                        periodic_report(last_report, end_time,
-                                                        r_shares, blocks.value,
-                                                        cached_totals["hashrate"],
-                                                        uptime)
-                                        last_report = time()
-                                        last_shares = cached_totals["accept"]
-                                break
+                    avg_ping = sum(recent_pings) / len(recent_pings) if recent_pings else 0
+                    if _should_switch_pool(avg_ping):
+                        try:
+                            new_pool = Client.fetch_pool()
+                            pool_metrics[new_pool]  # initialize
+                            best_pool = _choose_best_pool()
+                            if best_pool != current_pool:
+                                current_pool = best_pool
+                            else:
+                                current_pool = new_pool
+                            last_pool_switch = time()
+                            prefetch_stop.set()
                             break
-                    except Exception as e:
-                        pretty_print(get_string("error_while_mining")
-                                     + " " + str(e), "error", "net" + str(id),
-                                     print_queue=print_queue)
-                        sleep(5)
-                        break
+                        except Exception:
+                            pass
+
+                    if prefetch_error["err"]:
+                        raise prefetch_error["err"]
             except Exception as e:
                 pretty_print(get_string("error_while_mining")
                                      + " " + str(e), "error", "net" + str(id),
                                      print_queue=print_queue)
+                pool_metrics[current_pool]["errors"] += 1
+                sleep(5)
+            finally:
+                prefetch_stop.set()
+                try:
+                    if prefetch_thread:
+                        prefetch_thread.join(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
 
 class Discord_rp:
