@@ -7,6 +7,7 @@ import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 import requests
@@ -35,6 +36,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.append(str(project_root))
+    __package__ = "gui"
 
 from .config import Configuration, THEMES, validate_config
 from .config_store import load_config, save_config
