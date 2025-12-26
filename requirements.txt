@@ -7,3 +7,4 @@ psutil
 libducohasher
 pyopencl
 numpy
+PySide6
