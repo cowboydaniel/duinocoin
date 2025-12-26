@@ -370,13 +370,13 @@ class GpuHasher:
 
     def _global_size(self, count: int) -> int:
         group = self.work_group_size
-        max_groups = max(1, self.max_items_dim0 // group)
-        groups = min((count + group - 1) // group, max_groups)
+        groups = (count + group - 1) // group
         return max(group, groups * group)
 
     def _batch_size_for_multiplier(self, multiplier: float) -> int:
         raw_size = int(self.work_group_size * self.compute_units * multiplier)
-        clamped = min(max(self.work_group_size, raw_size), self.max_items_dim0)
+        max_batch_limit = self.max_items_dim0 * max(1, self.compute_units) * 8
+        clamped = min(max(self.work_group_size, raw_size), max_batch_limit)
         groups = max(1, clamped // self.work_group_size)
         return groups * self.work_group_size
 

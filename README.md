@@ -49,6 +49,7 @@ The miner will prompt for configuration details on first launch and downloads la
 - **Discrete NVIDIA/AMD (e.g., RTX 20xx/30xx, RX 5000/6000):** auto-detected work groups usually pick 512–1024; start with `--batch-multiplier 2` (default) and let autotune raise it if the device remains underutilized.
 - **Integrated GPUs (Intel/AMD iGPU):** work groups often cap at 256; keep the default multiplier or lower it (`--batch-multiplier 1`) if you see driver resets or throttling.
 - The miner clamps batch sizes to each device's `MAX_WORK_ITEM_SIZES[0]` and stops increasing the multiplier once throughput gains plateau to reduce instability on marginal devices.
+- Batch sizing scales from `work_group_size * compute_units * multiplier` and is bounded by the device work-item limit across compute units so high multipliers don't starve throughput on larger GPUs.
 
 ### Troubleshooting GPU startup
 - **Missing PyOpenCL:** install it manually as shown above. Auto-installation is disabled for GPU packages to avoid driver conflicts.
