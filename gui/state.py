@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
 import time
 from dataclasses import dataclass, field, replace
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional
-from dataclasses import dataclass, replace
-from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from .config import Configuration, load_config, save_config, validate_config
+from .config import Configuration as BaseConfiguration, validate_config
 
 
 @dataclass
@@ -73,15 +71,9 @@ class LiveStats:
 
 
 @dataclass
-class Configuration:
+class Configuration(BaseConfiguration):
     """User configuration for the miners."""
 
-    cpu_threads: int = 1
-    gpu_devices: List[str] = field(default_factory=list)
-    intensity: int = 1
-    server: str = "server.duinocoin.com"
-    port: int = 2813
-    auto_start: bool = False
     wallet_username: str = ""
     wallet_token: str = ""
 
@@ -114,7 +106,6 @@ class AppState(QObject):
         self.cpu_status = MinerStatus()
         self.gpu_status = MinerStatus()
         self.live_stats = LiveStats()
-        self.config = load_config()
         self.config = Configuration()
         self.notifications: List[NotificationEntry] = []
         self.log_path = Path("duinocoin-gui.log")
@@ -159,14 +150,11 @@ class AppState(QObject):
 
     def set_config(self, config: Configuration) -> None:
         self.config = validate_config(config)
-        save_config(self.config)
         self.config_changed.emit(self.config)
 
     def update_config(self, **updates) -> None:
         updated = replace(self.config, **updates)
         self.set_config(updated)
-        self.config = replace(self.config, **updates)
-        self.config_changed.emit(self.config)
 
     def add_notification(self, message: str, severity: str = "info", miner: Optional[str] = None) -> None:
         entry = NotificationEntry(message=message, severity=severity, miner=miner)
@@ -207,6 +195,7 @@ class AppState(QObject):
         handler.setFormatter(formatter)
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(handler)
+
     def set_metrics(self, miner_type: str, metrics: MinerMetrics) -> None:
         """Persist metrics for a miner (e.g., 'cpu' or 'gpu') and emit changes."""
         self.metrics[miner_type] = metrics

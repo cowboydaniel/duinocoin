@@ -2,39 +2,33 @@
 
 from __future__ import annotations
 
-import sys
 import json
+import sys
 import time
-from typing import Iterable, Optional
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
+from typing import Callable, Iterable, Optional
 
 import requests
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from dataclasses import replace
-from typing import Iterable
-from typing import Callable, Iterable
-
-from concurrent.futures import Future, ThreadPoolExecutor
-
-from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
-    QMainWindow,
-    QPlainTextEdit,
-    QMessageBox,
-    QPushButton,
-    QFrame,
     QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
     QSpacerItem,
     QSizePolicy,
     QSpinBox,
@@ -43,26 +37,20 @@ from PySide6.QtWidgets import (
 )
 
 from .config import Configuration, THEMES, validate_config
-from .state import AppState, LiveStats, MinerStatus, WalletData
+from .config_store import load_config, save_config
 from .metrics import MinerMetricsParser
+from .miner_process import MinerProcessManager
 from .state import (
     AppState,
-    Configuration,
     LiveStats,
+    MinerLogEntry,
+    MinerMetrics,
     MinerStatus,
     NotificationEntry,
     WalletData,
 )
-    MinerMetrics,
-    MinerStatus,
-    MinerLogEntry,
-    WalletData,
-)
-from .config_store import load_config, save_config
-from .state import AppState, Configuration, LiveStats, MinerStatus, WalletData
 from .wallet_client import WalletAuthError, WalletClient, WalletClientError, WalletCredentials
 from .wallet_dialog import WalletCredentialsDialog
-from .miner_process import MinerProcessManager
 
 
 def format_hashrate(hashrate: float) -> str:
@@ -84,7 +72,12 @@ def format_uptime(seconds: int) -> str:
 class WalletSummaryPanel(QGroupBox):
     """Shows wallet balances and payout data."""
 
-    def __init__(self, state: AppState, on_edit_credentials, on_manual_refresh) -> None:
+    def __init__(
+        self,
+        state: AppState,
+        on_edit_credentials: Callable[[], None],
+        on_manual_refresh: Callable[..., None],
+    ) -> None:
         super().__init__("Wallet Summary")
         self.state = state
         self._worker: Optional[WalletWorker] = None
@@ -198,7 +191,8 @@ class CpuMinerPanel(QGroupBox):
         self._stop_callback()
 
     def _handle_restart(self) -> None:
-        self.state.update_cpu_status(running=True, hashrate=0.0, last_error=None, connected=True)
+        self._stop_callback()
+        self._start_callback()
         self.state.add_notification("CPU miner restarted", miner="CPU")
 
     def refresh(self, status: MinerStatus) -> None:
@@ -285,7 +279,8 @@ class GpuMinerPanel(QGroupBox):
         self._stop_callback()
 
     def _handle_restart(self) -> None:
-        self.state.update_gpu_status(running=True, hashrate=0.0, last_error=None, connected=True)
+        self._stop_callback()
+        self._start_callback()
         self.state.add_notification("GPU miner restarted", miner="GPU")
 
     def refresh_status(self, status: MinerStatus) -> None:
@@ -749,6 +744,8 @@ class WalletWorker(QThread):
                 break
         if last_error:
             self.error.emit(last_error)
+
+
 class AppWindow(QMainWindow):
     """Main application window that wires together panels and state."""
 
@@ -765,56 +762,57 @@ class AppWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout()
-        self.wallet_panel = WalletSummaryPanel(self.state)
-        layout.addWidget(self.wallet_panel)
-        layout.addWidget(
-            WalletSummaryPanel(
-                self.state, self._open_wallet_dialog, self.refresh_wallet_data
-            )
+        self.wallet_panel = WalletSummaryPanel(
+            self.state, self._open_wallet_dialog, self.refresh_wallet_data
         )
-        layout.addWidget(CpuMinerPanel(self.state))
-        layout.addWidget(GpuMinerPanel(self.state))
-        layout.addWidget(WalletSummaryPanel(self.state))
-        layout.addWidget(
-            CpuMinerPanel(
-                self.state,
-                start_callback=self._start_cpu_miner,
-                stop_callback=self._stop_cpu_miner,
-            )
+        self.cpu_panel = CpuMinerPanel(
+            self.state,
+            start_callback=self._start_cpu_miner,
+            stop_callback=self._stop_cpu_miner,
         )
-        layout.addWidget(
-            GpuMinerPanel(
-                self.state,
-                start_callback=self._start_gpu_miner,
-                stop_callback=self._stop_gpu_miner,
-            )
+        self.gpu_panel = GpuMinerPanel(
+            self.state,
+            start_callback=self._start_gpu_miner,
+            stop_callback=self._stop_gpu_miner,
         )
-        layout.addWidget(LiveStatsPanel(self.state))
-        layout.addWidget(MinerGaugesPanel(self.state))
-        layout.addWidget(SettingsPanel(self.state))
-        layout.addWidget(NotificationPanel(self.state))
-        layout.addWidget(DiagnosticsPanel(self.state))
+        self.live_stats_panel = LiveStatsPanel(self.state)
+        self.cpu_gauges = MinerGaugesPanel(self.state, miner_type="cpu")
+        self.gpu_gauges = MinerGaugesPanel(self.state, miner_type="gpu")
+        self.settings_panel = SettingsPanel(self.state)
+        self.notification_panel = NotificationPanel(self.state)
+        self.diagnostics_panel = DiagnosticsPanel(self.state)
+
+        for widget in [
+            self.wallet_panel,
+            self.cpu_panel,
+            self.gpu_panel,
+            self.live_stats_panel,
+            self.cpu_gauges,
+            self.gpu_gauges,
+            self.settings_panel,
+            self.notification_panel,
+            self.diagnostics_panel,
+        ]:
+            layout.addWidget(widget)
         layout.addStretch(1)
         central.setLayout(layout)
         self.setCentralWidget(central)
 
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(60_000)
+        self.refresh_timer.setInterval(self.state.config.refresh_interval * 1000)
         self.refresh_timer.timeout.connect(self.refresh_wallet_data)
 
         self.state.config_changed.connect(self._handle_config_changed)
 
         self._seed_default_state()
         self.health_monitor.start()
-        self.wallet_panel._refresh_wallet()
         self.refresh_timer.start()
-        self.refresh_wallet_data()
+        self.refresh_wallet_data(force=True)
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(1_000)
         self.status_timer.timeout.connect(self._sync_process_states)
         self.status_timer.start()
 
-        self._seed_default_state()
         QApplication.instance().aboutToQuit.connect(self.process_manager.stop_all)
 
     def _sync_process_states(self) -> None:
@@ -850,7 +848,6 @@ class AppWindow(QMainWindow):
         self.state.update_live_stats(uptime_seconds=0, difficulty=0.0, total_hashes=0)
         if not self.state.config.gpu_devices:
             self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
-        self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
         # Warm up gauges with sample miner output.
         sample_lines = [
             "Accepted share #1 3.2 kH/s reward: 0.0021 DUCO",
@@ -871,8 +868,6 @@ class AppWindow(QMainWindow):
         self.state.set_metrics(miner_type, metrics)
         if log_entry:
             self.state.add_log_entry(log_entry)
-        if not self.state.config.gpu_devices:
-            self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
 
     def _open_wallet_dialog(self) -> None:
         dialog = WalletCredentialsDialog(self.state.config, parent=self)
@@ -929,6 +924,7 @@ class AppWindow(QMainWindow):
 
     def _handle_config_changed(self, config: Configuration) -> None:
         self.wallet_client = WalletClient(server=config.server)
+        self.refresh_timer.setInterval(config.refresh_interval * 1000)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._wallet_executor.shutdown(cancel_futures=True)
