@@ -5,10 +5,13 @@ from __future__ import annotations
 import sys
 from typing import Iterable
 
-from PySide6.QtCore import Qt
+from concurrent.futures import Future, ThreadPoolExecutor
+
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -17,12 +20,17 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QSpacerItem,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from .config_store import load_config, save_config
 from .state import AppState, Configuration, LiveStats, MinerStatus, WalletData
+from .wallet_client import WalletAuthError, WalletClient, WalletClientError, WalletCredentials
+from .wallet_dialog import WalletCredentialsDialog
 
 
 def format_hashrate(hashrate: float) -> str:
@@ -44,7 +52,7 @@ def format_uptime(seconds: int) -> str:
 class WalletSummaryPanel(QGroupBox):
     """Shows wallet balances and payout data."""
 
-    def __init__(self, state: AppState) -> None:
+    def __init__(self, state: AppState, on_edit_credentials, on_manual_refresh) -> None:
         super().__init__("Wallet Summary")
         self.state = state
 
@@ -58,6 +66,16 @@ class WalletSummaryPanel(QGroupBox):
         layout.addRow("Balance:", self.balance_label)
         layout.addRow("Pending:", self.pending_label)
         layout.addRow("Last payout:", self.last_payout_label)
+
+        button_row = QHBoxLayout()
+        settings_button = QPushButton("Wallet settings")
+        settings_button.clicked.connect(on_edit_credentials)
+        button_row.addWidget(settings_button)
+        refresh_button = QPushButton("Refresh now")
+        refresh_button.clicked.connect(lambda: on_manual_refresh(force=True))
+        button_row.addWidget(refresh_button)
+        button_row.addSpacerItem(QSpacerItem(20, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        layout.addRow(button_row)
         self.setLayout(layout)
 
         self.state.wallet_changed.connect(self.refresh)
@@ -271,11 +289,18 @@ class AppWindow(QMainWindow):
     def __init__(self, state: AppState) -> None:
         super().__init__()
         self.state = state
+        self.wallet_client = WalletClient(server=self.state.config.server)
+        self._wallet_executor = ThreadPoolExecutor(max_workers=1)
+        self._inflight_wallet_future: Future | None = None
         self.setWindowTitle("Duino Coin")
 
         central = QWidget()
         layout = QVBoxLayout()
-        layout.addWidget(WalletSummaryPanel(self.state))
+        layout.addWidget(
+            WalletSummaryPanel(
+                self.state, self._open_wallet_dialog, self.refresh_wallet_data
+            )
+        )
         layout.addWidget(CpuMinerPanel(self.state))
         layout.addWidget(GpuMinerPanel(self.state))
         layout.addWidget(LiveStatsPanel(self.state))
@@ -284,19 +309,93 @@ class AppWindow(QMainWindow):
         central.setLayout(layout)
         self.setCentralWidget(central)
 
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setInterval(60_000)
+        self.refresh_timer.timeout.connect(self.refresh_wallet_data)
+
+        self.state.config_changed.connect(self._handle_config_changed)
+
         self._seed_default_state()
+        self.refresh_timer.start()
+        self.refresh_wallet_data()
 
     def _seed_default_state(self) -> None:
         """Populate placeholder data so the UI has initial content."""
-        self.state.update_wallet(username="anonymous", balance=0.0, pending_rewards=0.0)
+        if not self.state.wallet.username:
+            self.state.update_wallet(
+                username="anonymous", balance=0.0, pending_rewards=0.0
+            )
         self.state.update_live_stats(uptime_seconds=0, difficulty=0.0, total_hashes=0)
-        self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
+        if not self.state.config.gpu_devices:
+            self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
+
+    def _open_wallet_dialog(self) -> None:
+        dialog = WalletCredentialsDialog(self.state.config, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            username, token = dialog.get_credentials()
+            self.state.update_config(wallet_username=username, wallet_token=token)
+            self.refresh_wallet_data(force=True)
+
+    def refresh_wallet_data(self, force: bool = False) -> None:
+        """Refresh wallet data from the API asynchronously."""
+        if self._inflight_wallet_future and not self._inflight_wallet_future.done():
+            if not force:
+                return
+            self._inflight_wallet_future.cancel()
+
+        credentials = WalletCredentials(
+            username=self.state.config.wallet_username,
+            token=self.state.config.wallet_token or None,
+        )
+        if not credentials.username:
+            return
+
+        self._inflight_wallet_future = self._wallet_executor.submit(
+            self.wallet_client.fetch_wallet, credentials
+        )
+        self._inflight_wallet_future.add_done_callback(self._handle_wallet_result)
+
+    def _handle_wallet_result(self, future: Future) -> None:
+        try:
+            wallet = future.result()
+        except WalletAuthError:
+            wallet = WalletData(
+                username=self.state.config.wallet_username,
+                balance=0.0,
+                pending_rewards=0.0,
+                last_payout="Invalid credentials",
+            )
+        except WalletClientError:
+            wallet = WalletData(
+                username=self.state.config.wallet_username,
+                balance=self.state.wallet.balance,
+                pending_rewards=self.state.wallet.pending_rewards,
+                last_payout=self.state.wallet.last_payout,
+            )
+        except Exception:
+            wallet = WalletData(
+                username=self.state.config.wallet_username,
+                balance=self.state.wallet.balance,
+                pending_rewards=self.state.wallet.pending_rewards,
+                last_payout="Unable to refresh",
+            )
+
+        QTimer.singleShot(0, lambda: self.state.set_wallet(wallet))
+
+    def _handle_config_changed(self, config: Configuration) -> None:
+        self.wallet_client = WalletClient(server=config.server)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._wallet_executor.shutdown(cancel_futures=True)
+        super().closeEvent(event)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     """Start the PySide6 application."""
     app = QApplication(list(argv) if argv is not None else sys.argv)
     state = AppState()
+    state.set_config(load_config(state.config))
+    state.config_changed.connect(save_config)
     window = AppWindow(state)
     window.resize(600, 800)
     window.show()
@@ -305,4 +404,3 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
