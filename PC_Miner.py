@@ -464,7 +464,7 @@ class Algorithms:
         if time_elapsed > 0:
             hashrate = 1e9 * nonce / time_elapsed
         else:
-            return [nonce, 0]
+            return [nonce,0]
 
         return [nonce, hashrate]
 
@@ -1329,7 +1329,7 @@ class Miner:
         PREFETCH_BACKOFF = 1.0
 
         def _efficiency_from_intensity(intensity: int):
-            if intensity >= 90:
+            if 99 > intensity >= 90:
                 return 0.005
             elif 90 > intensity >= 70:
                 return 0.1
