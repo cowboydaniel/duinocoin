@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Iterable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -14,15 +14,25 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QFrame,
+    QListWidgetItem,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from .state import AppState, Configuration, LiveStats, MinerStatus, WalletData
+from .metrics import MinerMetricsParser
+from .state import (
+    AppState,
+    Configuration,
+    LiveStats,
+    MinerMetrics,
+    MinerStatus,
+    MinerLogEntry,
+    WalletData,
+)
 
 
 def format_hashrate(hashrate: float) -> str:
@@ -206,6 +216,138 @@ class LiveStatsPanel(QGroupBox):
         self.ping_label.setText(f"{stats.ping_ms:.1f} ms" if stats.ping_ms else "N/A")
 
 
+class GaugeWidget(QFrame):
+    """Simple colored gauge with a title and value label."""
+
+    STATES = {
+        "ok": "background-color: #e8f5e9; border: 1px solid #66bb6a;",
+        "warn": "background-color: #fff3e0; border: 1px solid #ffa726;",
+        "error": "background-color: #ffebee; border: 1px solid #ef5350;",
+    }
+
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        layout = QVBoxLayout()
+        self.title_label = QLabel(title)
+        self.value_label = QLabel("-")
+        self.detail_label = QLabel("")
+        self.title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.value_label)
+        layout.addWidget(self.detail_label)
+        layout.addStretch(1)
+        self.setLayout(layout)
+        self.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        self.set_state("ok")
+
+    def set_state(self, state: str) -> None:
+        style = self.STATES.get(state, self.STATES["ok"])
+        self.setStyleSheet(style)
+
+    def update_value(self, value: str, detail: str = "", state: str = "ok") -> None:
+        self.value_label.setText(value)
+        self.detail_label.setText(detail)
+        self.set_state(state)
+
+
+class MinerGaugesPanel(QGroupBox):
+    """Dashboard gauges fed by live miner metrics."""
+
+    def __init__(self, state: AppState, miner_type: str = "cpu") -> None:
+        super().__init__("Miner Gauges")
+        self.state = state
+        self.miner_type = miner_type
+        self.metrics = MinerMetrics()
+
+        gauges_row = QHBoxLayout()
+        self.hashrate_gauge = GaugeWidget("Hashrate")
+        self.share_rate_gauge = GaugeWidget("Share rate")
+        self.temperature_gauge = GaugeWidget("Temperature")
+        self.rewards_gauge = GaugeWidget("Projected DUCO/day")
+        gauges_row.addWidget(self.hashrate_gauge)
+        gauges_row.addWidget(self.share_rate_gauge)
+        gauges_row.addWidget(self.temperature_gauge)
+        gauges_row.addWidget(self.rewards_gauge)
+
+        self.alert_label = QLabel("")
+        self.alert_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+
+        self.log_list = QListWidget()
+        self.log_list.setMaximumHeight(150)
+
+        layout = QVBoxLayout()
+        layout.addLayout(gauges_row)
+        layout.addWidget(self.alert_label)
+        layout.addWidget(QLabel("Recent miner messages:"))
+        layout.addWidget(self.log_list)
+        self.setLayout(layout)
+
+        self.state.metrics_changed.connect(self._on_metrics_changed)
+        self.state.log_added.connect(self._on_log_added)
+
+        self.refresh(self.state.metrics.get(self.miner_type, MinerMetrics()))
+        self._start_refresh_timer()
+
+    def _start_refresh_timer(self) -> None:
+        timer = QTimer(self)
+        timer.setInterval(1000)
+        timer.timeout.connect(self._refresh_from_state)
+        timer.start()
+        self.timer = timer
+
+    def _refresh_from_state(self) -> None:
+        self.refresh(self.state.metrics.get(self.miner_type, MinerMetrics()))
+
+    def _on_metrics_changed(self, miner_type: str, metrics: MinerMetrics) -> None:
+        if miner_type == self.miner_type:
+            self.refresh(metrics)
+
+    def _on_log_added(self, entry: MinerLogEntry) -> None:
+        item = QListWidgetItem(f"[{entry.level.upper()}] {entry.message}")
+        if entry.level == "error":
+            item.setForeground(Qt.red)
+        elif entry.level == "warning":
+            item.setForeground(Qt.darkYellow)
+        else:
+            item.setForeground(Qt.darkGreen)
+        self.log_list.addItem(item)
+        self.log_list.scrollToBottom()
+        if self.log_list.count() > 200:
+            self.log_list.takeItem(0)
+
+    def refresh(self, metrics: MinerMetrics) -> None:
+        self.metrics = metrics
+
+        hashrate_state = "ok" if metrics.hashrate > 0 else "warn"
+        self.hashrate_gauge.update_value(format_hashrate(metrics.hashrate), "", hashrate_state)
+
+        share_state = "ok" if metrics.share_rate_per_min > 0 else "warn"
+        if metrics.rejected_shares > 0:
+            share_state = "warn"
+        self.share_rate_gauge.update_value(f"{metrics.share_rate_per_min:.2f} / min", "", share_state)
+
+        temp_detail = "-" if metrics.temperature_c is None else f"{metrics.temperature_c:.1f} °C"
+        temp_state = "ok"
+        if metrics.temperature_c is not None:
+            if metrics.temperature_c >= 85:
+                temp_state = "error"
+            elif metrics.temperature_c >= 75:
+                temp_state = "warn"
+        self.temperature_gauge.update_value(temp_detail, state=temp_state)
+
+        reward_state = "ok"
+        if metrics.last_error:
+            reward_state = "error"
+        elif metrics.rejected_shares > 0:
+            reward_state = "warn"
+        self.rewards_gauge.update_value(f"{metrics.projected_duco_per_day:.4f}", "DUCO / day", reward_state)
+
+        alert_text = metrics.last_error or ""
+        if metrics.rejected_shares > 0 and not alert_text:
+            alert_text = f"Rejected shares: {metrics.rejected_shares}"
+        self.alert_label.setText(alert_text)
+
+
 class SettingsPanel(QGroupBox):
     """Allows basic configuration updates for the miners."""
 
@@ -271,6 +413,7 @@ class AppWindow(QMainWindow):
     def __init__(self, state: AppState) -> None:
         super().__init__()
         self.state = state
+        self.parsers = {"cpu": MinerMetricsParser(), "gpu": MinerMetricsParser()}
         self.setWindowTitle("Duino Coin")
 
         central = QWidget()
@@ -279,6 +422,7 @@ class AppWindow(QMainWindow):
         layout.addWidget(CpuMinerPanel(self.state))
         layout.addWidget(GpuMinerPanel(self.state))
         layout.addWidget(LiveStatsPanel(self.state))
+        layout.addWidget(MinerGaugesPanel(self.state))
         layout.addWidget(SettingsPanel(self.state))
         layout.addStretch(1)
         central.setLayout(layout)
@@ -291,6 +435,26 @@ class AppWindow(QMainWindow):
         self.state.update_wallet(username="anonymous", balance=0.0, pending_rewards=0.0)
         self.state.update_live_stats(uptime_seconds=0, difficulty=0.0, total_hashes=0)
         self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
+        # Warm up gauges with sample miner output.
+        sample_lines = [
+            "Accepted share #1 3.2 kH/s reward: 0.0021 DUCO",
+            "Hashrate: 3.2 kH/s",
+            "Temperature: 68C",
+            "Accepted share #2 reward 0.0019 DUCO",
+            "Rejected share due to stale job",
+        ]
+        for line in sample_lines:
+            self.process_miner_output("cpu", line)
+
+    def process_miner_output(self, miner_type: str, line: str) -> None:
+        """Parse miner stdout, update metrics, and surface logs."""
+        parser = self.parsers.get(miner_type)
+        if parser is None:
+            return
+        metrics, log_entry = parser.parse_line(line)
+        self.state.set_metrics(miner_type, metrics)
+        if log_entry:
+            self.state.add_log_entry(log_entry)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -305,4 +469,3 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
