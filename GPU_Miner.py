@@ -13,6 +13,7 @@ import argparse
 import base64
 import socket
 import sys
+from datetime import datetime
 from configparser import ConfigParser
 from hashlib import sha1
 from pathlib import Path
@@ -305,6 +306,7 @@ class GpuHasher:
         self.context: Optional[cl.Context] = None
         self.queue: Optional[cl.CommandQueue] = None
         self.program: Optional[cl.Program] = None
+        self.kernel: Optional[cl.Kernel] = None
         self.max_group = None
         self.compute_units = None
         self.batch_size = None
@@ -332,6 +334,7 @@ class GpuHasher:
     def _build_program(self) -> None:
         try:
             self.program = cl.Program(self.context, self.KERNEL_SOURCE).build()
+            self.kernel = cl.Kernel(self.program, "ducos1")
         except Exception as exc:  # pragma: no cover - kernel compilation
             raise SystemExit(f"Failed to compile OpenCL kernel: {exc}")
 
@@ -357,7 +360,7 @@ class GpuHasher:
         groups = (count + group - 1) // group
         return groups * group
 
-    def solve_job(self, last_hash: str, expected: str, difficulty: int) -> Tuple[int, float]:
+    def solve_job(self, last_hash: str, expected: str, difficulty: int) -> Tuple[int, float, float]:
         if not isinstance(expected, str):
             expected = str(expected)
 
@@ -393,10 +396,7 @@ class GpuHasher:
             nonce_count = batch
 
             cl.enqueue_fill_buffer(self.queue, found_flag_buf, b"\x00\x00\x00\x00", 0, 4)
-            self.program.ducos1(
-                self.queue,
-                (global_size,),
-                (self.work_group_size,),
+            self.kernel.set_args(
                 last_buf,
                 np.uint8(len(last_bytes)),
                 np.uint32(start_nonce),
@@ -404,6 +404,12 @@ class GpuHasher:
                 expected_buf,
                 found_nonce_buf,
                 found_flag_buf,
+            )
+            cl.enqueue_nd_range_kernel(
+                self.queue,
+                self.kernel,
+                (global_size,),
+                (self.work_group_size,),
             )
             self.queue.finish()
 
@@ -421,8 +427,13 @@ class GpuHasher:
             total_processed = start_nonce
 
         elapsed = time_ns() - time_start
+        elapsed_seconds = elapsed / 1e9 if elapsed else 0.0
         hashrate = (1e9 * total_processed / elapsed) if elapsed else 0.0
-        return found_nonce if found_nonce != -1 else nonce_limit, hashrate
+        return (
+            found_nonce if found_nonce != -1 else nonce_limit,
+            hashrate,
+            elapsed_seconds,
+        )
 
 
 def gpu_worker(
@@ -439,10 +450,10 @@ def gpu_worker(
 
         last_hash, expected, difficulty = job
         try:
-            nonce, hashrate = hasher.solve_job(last_hash, expected, difficulty)
-            result_queue.put((job, nonce, hashrate, None))
+            nonce, hashrate, elapsed = hasher.solve_job(last_hash, expected, difficulty)
+            result_queue.put((job, nonce, hashrate, elapsed, None))
         except Exception as exc:  # pragma: no cover - worker safety
-            result_queue.put((job, None, 0.0, exc))
+            result_queue.put((job, None, 0.0, 0.0, exc))
 
 
 def discover_gpu_devices() -> Sequence:
@@ -474,6 +485,23 @@ def _decode_mining_key(raw_key: str) -> str:
         return base64.b64decode(raw_key).decode("utf-8")
     except Exception:
         return raw_key
+
+
+def get_prefix(symbol: str, val: float, accuracy: int) -> str:
+    """
+    Convert hashrate or difficulty figures to human friendly units.
+    """
+    if val >= 1_000_000_000_000:
+        val = str(round((val / 1_000_000_000_000), accuracy)) + " T"
+    elif val >= 1_000_000_000:
+        val = str(round((val / 1_000_000_000), accuracy)) + " G"
+    elif val >= 1_000_000:
+        val = str(round((val / 1_000_000), accuracy)) + " M"
+    elif val >= 1_000:
+        val = str(round((val / 1_000), accuracy)) + " k"
+    else:
+        val = str(round(val)) + " "
+    return val + symbol
 
 
 def parse_args(
@@ -584,7 +612,7 @@ def submit_result(
     hashrate: float,
     identifier: str,
     single_miner_id: int,
-) -> str:
+) -> Tuple[str, float]:
     payload = (
         f"{nonce}"
         + Settings.SEPARATOR
@@ -597,9 +625,11 @@ def submit_result(
         + Settings.SEPARATOR
         + f"{single_miner_id}"
     )
+    start = time()
     sock.sendall(payload.encode(Settings.ENCODING))
     response = sock.recv(128).decode(Settings.ENCODING).rstrip("\n")
-    return response
+    ping_ms = (time() - start) * 1000
+    return response, ping_ms
 
 
 def mine(args: argparse.Namespace) -> None:
@@ -630,6 +660,8 @@ def mine(args: argparse.Namespace) -> None:
     job_queue: Queue = Queue(maxsize=8)
     result_queue: Queue = Queue(maxsize=8)
     stop_event = Event()
+    accept_count = 0
+    reject_count = 0
     worker = Thread(
         target=gpu_worker,
         args=(hasher, job_queue, result_queue, stop_event),
@@ -648,7 +680,9 @@ def mine(args: argparse.Namespace) -> None:
                 print(f"Connected to pool {pool[0]}:{pool[1]} (v{pool_version})")
 
                 while True:
+                    time_start = time()
                     job = request_job(sock, args.username, args.start_diff or "LOW", mining_key)
+                    ping_ms = (time() - time_start) * 1000
                     try:
                         job_queue.put(job, timeout=Settings.SOC_TIMEOUT)
                     except Exception:
@@ -661,7 +695,7 @@ def mine(args: argparse.Namespace) -> None:
                         print("GPU worker timeout waiting for result", file=sys.stderr)
                         continue
 
-                    (last_hash, expected, difficulty), nonce, hashrate, error = job_result
+                    (last_hash, expected, difficulty), nonce, hashrate, compute_time, error = job_result
                     expected_hex = expected.lower()
 
                     if error:
@@ -678,7 +712,7 @@ def mine(args: argparse.Namespace) -> None:
                         )
                         continue
 
-                    feedback = submit_result(
+                    feedback, response_ping = submit_result(
                         sock,
                         nonce,
                         hashrate,
@@ -687,23 +721,96 @@ def mine(args: argparse.Namespace) -> None:
                     )
                     parts = feedback.split(Settings.SEPARATOR)
                     status = parts[0] if parts else "UNKNOWN"
+                    total_ping = ping_ms + response_ping
+                    total_shares = accept_count + reject_count + 1
+                    success_percent = (
+                        (accept_count + (1 if status in ("GOOD", "BLOCK") else 0))
+                        / total_shares
+                        * 100
+                    )
+                    hashrate_pretty = get_prefix("H/s", hashrate, 2)
+                    total_hashrate_pretty = get_prefix("H/s", hashrate, 2)
+                    diff_pretty = get_prefix("", int(difficulty), 0).strip()
+                    worker_label = args.identifier or f"gpu{device_index}"
+                    share_header = (
+                        Fore.WHITE
+                        + datetime.now().strftime(Style.DIM + "%H:%M:%S ")
+                        + Style.RESET_ALL
+                        + Style.BRIGHT
+                        + Fore.YELLOW
+                        + f" {worker_label} "
+                        + Style.RESET_ALL
+                        + Fore.GREEN
+                        + "⛏ "
+                    )
                     if status == "GOOD":
+                        accept_count += 1
                         print(
-                            Style.BRIGHT
+                            share_header
                             + Fore.GREEN
-                            + f"Share accepted by {device.name} at {hashrate:.2f} H/s"
+                            + "Accepted "
+                            + f"{accept_count}/{total_shares} ({success_percent:.0f}%) "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"∙ {compute_time:04.1f}s ∙ "
+                            + Fore.BLUE
+                            + Style.BRIGHT
+                            + f"{hashrate_pretty} "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"({total_hashrate_pretty} total) "
+                            + Fore.YELLOW
+                            + "⚙ "
+                            + Fore.RESET
+                            + f"diff. {diff_pretty} ∙ "
+                            + Fore.CYAN
+                            + f"ping {int(total_ping)}ms"
                         )
                     elif status == "BLOCK":
+                        accept_count += 1
                         print(
-                            Style.BRIGHT
+                            share_header
                             + Fore.CYAN
-                            + f"Block found! {device.name} {hashrate:.2f} H/s"
+                            + "Block found "
+                            + f"{accept_count}/{total_shares} ({success_percent:.0f}%) "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"∙ {compute_time:04.1f}s ∙ "
+                            + Fore.BLUE
+                            + Style.BRIGHT
+                            + f"{hashrate_pretty} "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"({total_hashrate_pretty} total) "
+                            + Fore.YELLOW
+                            + "⚙ "
+                            + Fore.RESET
+                            + f"diff. {diff_pretty} "
+                            + Fore.CYAN
+                            + f"ping {int(total_ping)}ms"
                         )
                     else:
+                        reject_count += 1
                         print(
-                            Style.BRIGHT
+                            share_header
                             + Fore.RED
-                            + f"Share rejected: {feedback if feedback else 'No response'}"
+                            + "Rejected "
+                            + f"{accept_count}/{total_shares} ({success_percent:.0f}%) "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"∙ {compute_time:04.1f}s ∙ "
+                            + Fore.BLUE
+                            + Style.BRIGHT
+                            + f"{hashrate_pretty} "
+                            + Style.NORMAL
+                            + Fore.RESET
+                            + f"({total_hashrate_pretty} total) "
+                            + Fore.YELLOW
+                            + "⚙ "
+                            + Fore.RESET
+                            + f"diff. {diff_pretty} ∙ "
+                            + Fore.CYAN
+                            + f"ping {int(total_ping)}ms"
                         )
         except Exception as exc:  # pragma: no cover - runtime resiliency
             print(f"Mining error: {exc}", file=sys.stderr)
