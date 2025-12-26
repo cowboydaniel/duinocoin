@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import math
 import socket
 import sys
 from datetime import datetime
@@ -301,7 +302,15 @@ class GpuHasher:
     }
     """
 
-    def __init__(self, device, work_size: Optional[int], batch_multiplier: Optional[float]) -> None:
+    def __init__(
+        self,
+        device,
+        work_size: Optional[int],
+        batch_multiplier: Optional[float],
+        autotune_max_multiplier: Optional[float],
+        autotune_samples: Optional[int],
+        autotune_min_delta_scale: Optional[float],
+    ) -> None:
         self.device = device
         self.context: Optional[cl.Context] = None
         self.queue: Optional[cl.CommandQueue] = None
@@ -315,6 +324,17 @@ class GpuHasher:
         self.requested_work_size = work_size
         self.batch_multiplier_override = batch_multiplier is not None
         self.batch_multiplier = float(batch_multiplier) if batch_multiplier else 2.0
+        self.autotune_max_multiplier_override = autotune_max_multiplier
+        self.autotune_samples = (
+            autotune_samples if autotune_samples is not None else 5
+        )
+        if self.autotune_samples < 2:
+            self.autotune_samples = 2
+        self.autotune_min_delta_scale = (
+            autotune_min_delta_scale
+            if autotune_min_delta_scale is not None and autotune_min_delta_scale > 0
+            else 0.5
+        )
         self.autotune_done = False
         self._setup_opencl(device)
         self._build_program()
@@ -391,12 +411,11 @@ class GpuHasher:
         found_nonce_buf,
         found_flag_buf,
         last_len: int,
-    ) -> float:
+    ) -> Tuple[float, Sequence[float]]:
         nonce_count = self._batch_size_for_multiplier(multiplier)
-        total_elapsed = 0
-        total_nonces = 0
+        sample_rates = []
 
-        for _ in range(2):  # run a couple batches to smooth variance
+        for _ in range(self.autotune_samples):
             cl.enqueue_fill_buffer(self.queue, found_flag_buf, b"\x00\x00\x00\x00", 0, 4)
 
             self.kernel.set_args(
@@ -417,10 +436,38 @@ class GpuHasher:
                 (self.work_group_size,),
             )
             self.queue.finish()
-            total_elapsed += time_ns() - start
-            total_nonces += nonce_count
+            elapsed = time_ns() - start
+            if elapsed > 0:
+                sample_rates.append(1e9 * nonce_count / elapsed)
 
-        return (1e9 * total_nonces / total_elapsed) if total_elapsed else 0.0
+        if not sample_rates:
+            return 0.0, sample_rates
+
+        sorted_rates = sorted(sample_rates)
+        mid = len(sorted_rates) // 2
+        if len(sorted_rates) % 2 == 0:
+            median_rate = (sorted_rates[mid - 1] + sorted_rates[mid]) / 2
+        else:
+            median_rate = sorted_rates[mid]
+        return median_rate, sample_rates
+
+    def _max_autotune_multiplier(self) -> float:
+        if self.autotune_max_multiplier_override:
+            return max(1.0, float(self.autotune_max_multiplier_override))
+
+        if not self.work_group_size or not self.max_items_dim0:
+            return 12.0
+
+        theoretical_cap = (self.max_items_dim0 * 8) / float(self.work_group_size)
+        compute_factor = max(1.0, float(self.compute_units or 1))
+        workgroup_factor = max(1.0, float(self.max_group) / float(self.work_group_size))
+        adaptive_limit = 4.0 * compute_factor * workgroup_factor
+        bounded_limit = min(theoretical_cap, max(12.0, adaptive_limit))
+        if bounded_limit <= 0:
+            return 1.0
+        if theoretical_cap < 1.0:
+            return theoretical_cap
+        return max(1.0, bounded_limit)
 
     def _autotune_multiplier(
         self,
@@ -434,7 +481,7 @@ class GpuHasher:
             return
 
         plateau_tolerance = 0.05
-        max_multiplier = 12.0
+        max_multiplier = self._max_autotune_multiplier()
         step = 1.0
 
         best_multiplier = self.batch_multiplier
@@ -442,7 +489,7 @@ class GpuHasher:
         multiplier = self.batch_multiplier
 
         while multiplier <= max_multiplier:
-            rate = self._benchmark_multiplier(
+            rate, samples = self._benchmark_multiplier(
                 multiplier,
                 last_buf,
                 expected_buf,
@@ -450,7 +497,17 @@ class GpuHasher:
                 found_flag_buf,
                 last_len,
             )
-            if rate > best_rate * (1 + plateau_tolerance):
+            if not samples:
+                break
+
+            mean = sum(samples) / len(samples)
+            variance = sum((val - mean) ** 2 for val in samples) / len(samples)
+            relative_std = math.sqrt(variance) / mean if mean else 0.0
+            dynamic_tolerance = max(
+                plateau_tolerance, relative_std * self.autotune_min_delta_scale
+            )
+
+            if rate > best_rate * (1 + dynamic_tolerance):
                 best_rate = rate
                 best_multiplier = multiplier
                 multiplier += step
@@ -460,7 +517,8 @@ class GpuHasher:
         if best_multiplier != self.batch_multiplier:
             print(
                 f"Auto-tuned batch multiplier to {best_multiplier} "
-                f"(batch size {self._batch_size_for_multiplier(best_multiplier)})",
+                f"(batch size {self._batch_size_for_multiplier(best_multiplier)}, "
+                f"{self.autotune_samples} samples, max {max_multiplier:.1f})",
                 file=sys.stderr,
             )
         self.batch_multiplier = best_multiplier
@@ -720,6 +778,30 @@ def parse_args(
             "Higher values increase queued nonces; lower values reduce latency."
         ),
     )
+    parser.add_argument(
+        "--autotune-max-multiplier",
+        type=float,
+        dest="autotune_max_multiplier",
+        default=None,
+        help="Upper bound for batch multiplier autotuning (default: device-derived).",
+    )
+    parser.add_argument(
+        "--autotune-samples",
+        type=int,
+        dest="autotune_samples",
+        default=None,
+        help="Micro-benchmark samples per multiplier during autotune (default: 5).",
+    )
+    parser.add_argument(
+        "--autotune-min-delta-scale",
+        type=float,
+        dest="autotune_min_delta_scale",
+        default=None,
+        help=(
+            "Scale factor for variance-driven improvement threshold; larger values "
+            "require bigger gains to keep tuning (default: 0.5)."
+        ),
+    )
     parser.add_argument("--username", type=str, default=None, help="Wallet username override")
     parser.add_argument(
         "--mining-key",
@@ -767,11 +849,29 @@ def parse_args(
         if args.batch_multiplier is None and batch_mult_fallback is not None:
             args.batch_multiplier = section.getfloat("batch_multiplier")
 
+        auto_max_fallback = section.get("autotune_max_multiplier", fallback=None)
+        if args.autotune_max_multiplier is None and auto_max_fallback is not None:
+            args.autotune_max_multiplier = section.getfloat("autotune_max_multiplier")
+
+        auto_samples_fallback = section.get("autotune_samples", fallback=None)
+        if args.autotune_samples is None and auto_samples_fallback is not None:
+            args.autotune_samples = section.getint("autotune_samples")
+
+        auto_delta_fallback = section.get("autotune_min_delta_scale", fallback=None)
+        if args.autotune_min_delta_scale is None and auto_delta_fallback is not None:
+            args.autotune_min_delta_scale = section.getfloat("autotune_min_delta_scale")
+
     args.backend = (args.backend or "opencl").lower()
     if args.work_size is not None and args.work_size <= 0:
         raise SystemExit("Work size must be a positive integer.")
     if args.batch_multiplier is not None and args.batch_multiplier <= 0:
         raise SystemExit("Batch multiplier must be a positive number.")
+    if args.autotune_max_multiplier is not None and args.autotune_max_multiplier <= 0:
+        raise SystemExit("Autotune max multiplier must be a positive number.")
+    if args.autotune_samples is not None and args.autotune_samples < 2:
+        raise SystemExit("Autotune samples must be at least 2 to be meaningful.")
+    if args.autotune_min_delta_scale is not None and args.autotune_min_delta_scale <= 0:
+        raise SystemExit("Autotune minimum delta scale must be positive.")
 
     missing = [field for field in ("username",) if not getattr(args, field)]
     if missing:
@@ -848,7 +948,14 @@ def mine(args: argparse.Namespace) -> None:
         )
 
     device = devices[device_index]
-    hasher = GpuHasher(device, args.work_size, args.batch_multiplier)
+    hasher = GpuHasher(
+        device,
+        args.work_size,
+        args.batch_multiplier,
+        args.autotune_max_multiplier,
+        args.autotune_samples,
+        args.autotune_min_delta_scale,
+    )
 
     print(
         f"Using GPU device: {device.name} (platform: {device.platform.name})",
