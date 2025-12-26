@@ -494,15 +494,20 @@ class Algorithms:
         Slower than libducohasher but works on all Python versions.
         """
         time_start = time_ns()
-        exp_h_lower = exp_h.lower()
+
+        # Strip whitespace and normalize
+        last_h = last_h.strip()
+        exp_h = exp_h.strip().lower()
 
         # Debug output
-        print(f"DEBUG: last_h={last_h[:20]}..., exp_h={exp_h}, diff={diff}, eff={eff}")
+        print(f"DEBUG: last_h='{last_h}' (len={len(last_h)})")
+        print(f"DEBUG: exp_h='{exp_h}' (len={len(exp_h)})")
+        print(f"DEBUG: diff={diff}, eff={eff}, max_nonce={diff * 100 + 1}")
 
         max_nonce = diff * 100 + 1
         for nonce in range(max_nonce):
             candidate = sha1(f"{last_h}{nonce}".encode('ascii')).hexdigest()
-            if candidate == exp_h_lower:
+            if candidate == exp_h:
                 time_elapsed = time_ns() - time_start
                 if time_elapsed > 0:
                     hashrate = 1e9 * nonce / time_elapsed
@@ -516,7 +521,7 @@ class Algorithms:
         hashrate = 1e9 * max_nonce / time_elapsed if time_elapsed > 0 else 0
         # Show what hash we computed for nonce 0
         test_hash = sha1(f"{last_h}0".encode('ascii')).hexdigest()
-        print(f"DEBUG: No match found! max_nonce={max_nonce}, hash(0)={test_hash}")
+        print(f"DEBUG: No match found! hash(nonce=0)={test_hash}")
         return [0, hashrate]
 
     def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
