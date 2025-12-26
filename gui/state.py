@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
+
+from .config import Configuration, load_config, save_config, validate_config
 
 
 @dataclass
@@ -39,18 +41,6 @@ class LiveStats:
     ping_ms: Optional[float] = None
 
 
-@dataclass
-class Configuration:
-    """User configuration for the miners."""
-
-    cpu_threads: int = 1
-    gpu_devices: List[str] = field(default_factory=list)
-    intensity: int = 1
-    server: str = "server.duinocoin.com"
-    port: int = 2813
-    auto_start: bool = False
-
-
 class AppState(QObject):
     """Central store that emits signals whenever state changes."""
 
@@ -66,7 +56,7 @@ class AppState(QObject):
         self.cpu_status = MinerStatus()
         self.gpu_status = MinerStatus()
         self.live_stats = LiveStats()
-        self.config = Configuration()
+        self.config = load_config()
 
     def set_wallet(self, wallet: WalletData) -> None:
         self.wallet = wallet
@@ -101,10 +91,10 @@ class AppState(QObject):
         self.stats_changed.emit(self.live_stats)
 
     def set_config(self, config: Configuration) -> None:
-        self.config = config
+        self.config = validate_config(config)
+        save_config(self.config)
         self.config_changed.emit(self.config)
 
     def update_config(self, **updates) -> None:
-        self.config = replace(self.config, **updates)
-        self.config_changed.emit(self.config)
-
+        updated = replace(self.config, **updates)
+        self.set_config(updated)
