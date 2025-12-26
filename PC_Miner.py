@@ -496,13 +496,8 @@ class Algorithms:
         time_start = time_ns()
         exp_h_lower = exp_h.lower()
 
-        # The efficiency parameter controls mining speed
-        # Lower eff values = faster mining, higher = slower (for power saving)
-        # eff of 0 means maximum speed
-        if eff > 0:
-            sleep_time = eff / 1000.0  # Convert to reasonable sleep interval
-        else:
-            sleep_time = 0
+        # Debug output
+        print(f"DEBUG: last_h={last_h[:20]}..., exp_h={exp_h}, diff={diff}, eff={eff}")
 
         max_nonce = diff * 100 + 1
         for nonce in range(max_nonce):
@@ -513,15 +508,15 @@ class Algorithms:
                     hashrate = 1e9 * nonce / time_elapsed
                 else:
                     hashrate = 0
+                print(f"DEBUG: Found nonce={nonce}, hash={candidate}")
                 return [nonce, hashrate]
 
-            # Apply efficiency throttling periodically
-            if sleep_time > 0 and nonce % 1000 == 0:
-                sleep(sleep_time)
-
-        # No solution found (shouldn't happen with correct job)
+        # No solution found
         time_elapsed = time_ns() - time_start
         hashrate = 1e9 * max_nonce / time_elapsed if time_elapsed > 0 else 0
+        # Show what hash we computed for nonce 0
+        test_hash = sha1(f"{last_h}0".encode('ascii')).hexdigest()
+        print(f"DEBUG: No match found! max_nonce={max_nonce}, hash(0)={test_hash}")
         return [0, hashrate]
 
     def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
