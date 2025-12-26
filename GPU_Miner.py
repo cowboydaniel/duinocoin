@@ -301,7 +301,7 @@ class GpuHasher:
     }
     """
 
-    def __init__(self, device, work_size: Optional[int]) -> None:
+    def __init__(self, device, work_size: Optional[int], batch_multiplier: Optional[float]) -> None:
         self.device = device
         self.context: Optional[cl.Context] = None
         self.queue: Optional[cl.CommandQueue] = None
@@ -309,9 +309,13 @@ class GpuHasher:
         self.kernel: Optional[cl.Kernel] = None
         self.max_group = None
         self.compute_units = None
+        self.max_items_dim0 = None
         self.batch_size = None
         self.work_group_size = None
         self.requested_work_size = work_size
+        self.batch_multiplier_override = batch_multiplier is not None
+        self.batch_multiplier = float(batch_multiplier) if batch_multiplier else 2.0
+        self.autotune_done = False
         self._setup_opencl(device)
         self._build_program()
 
@@ -325,9 +329,11 @@ class GpuHasher:
             self.context = cl.Context(devices=[device])
             self.queue = cl.CommandQueue(self.context, device)
             self.max_group = int(device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE))
+            max_item_sizes = device.get_info(cl.device_info.MAX_WORK_ITEM_SIZES)
+            self.max_items_dim0 = int(max_item_sizes[0]) if max_item_sizes else self.max_group
             self.compute_units = int(device.get_info(cl.device_info.MAX_COMPUTE_UNITS))
             self.work_group_size = self._resolve_work_group_size()
-            self.batch_size = self.work_group_size * max(4, self.compute_units * 2)
+            self._update_batch_size()
         except Exception as exc:  # pragma: no cover - device provisioning
             raise SystemExit(f"Failed to initialize GPU device: {exc}")
 
@@ -339,7 +345,13 @@ class GpuHasher:
             raise SystemExit(f"Failed to compile OpenCL kernel: {exc}")
 
     def _resolve_work_group_size(self) -> int:
-        default_size = min(256, self.max_group)
+        max_allowed = min(self.max_group, self.max_items_dim0)
+
+        preferred_sizes = (1024, 512, 256, 128, 64)
+        default_size = next(
+            (size for size in preferred_sizes if size <= max_allowed),
+            max_allowed,
+        )
 
         if self.requested_work_size is None:
             return default_size
@@ -347,18 +359,113 @@ class GpuHasher:
         if self.requested_work_size <= 0:
             raise SystemExit("Work size must be a positive integer.")
 
-        if self.requested_work_size > self.max_group:
+        limit = max_allowed
+        if self.requested_work_size > limit:
             print(
                 f"Requested work size {self.requested_work_size} exceeds device limit "
-                f"{self.max_group}; using {self.max_group} instead.",
+                f"{limit}; using {limit} instead.",
                 file=sys.stderr,
             )
-        return min(self.requested_work_size, self.max_group)
+        return min(self.requested_work_size, limit)
 
     def _global_size(self, count: int) -> int:
         group = self.work_group_size
-        groups = (count + group - 1) // group
-        return groups * group
+        max_groups = max(1, self.max_items_dim0 // group)
+        groups = min((count + group - 1) // group, max_groups)
+        return max(group, groups * group)
+
+    def _batch_size_for_multiplier(self, multiplier: float) -> int:
+        raw_size = int(self.work_group_size * self.compute_units * multiplier)
+        clamped = min(max(self.work_group_size, raw_size), self.max_items_dim0)
+        groups = max(1, clamped // self.work_group_size)
+        return groups * self.work_group_size
+
+    def _update_batch_size(self) -> None:
+        self.batch_size = self._batch_size_for_multiplier(self.batch_multiplier)
+
+    def _benchmark_multiplier(
+        self,
+        multiplier: float,
+        last_buf,
+        expected_buf,
+        found_nonce_buf,
+        found_flag_buf,
+        last_len: int,
+    ) -> float:
+        nonce_count = self._batch_size_for_multiplier(multiplier)
+        total_elapsed = 0
+        total_nonces = 0
+
+        for _ in range(2):  # run a couple batches to smooth variance
+            cl.enqueue_fill_buffer(self.queue, found_flag_buf, b"\x00\x00\x00\x00", 0, 4)
+
+            self.kernel.set_args(
+                last_buf,
+                np.uint8(last_len),
+                np.uint32(0),
+                np.uint32(nonce_count),
+                expected_buf,
+                found_nonce_buf,
+                found_flag_buf,
+            )
+
+            start = time_ns()
+            cl.enqueue_nd_range_kernel(
+                self.queue,
+                self.kernel,
+                (self._global_size(nonce_count),),
+                (self.work_group_size,),
+            )
+            self.queue.finish()
+            total_elapsed += time_ns() - start
+            total_nonces += nonce_count
+
+        return (1e9 * total_nonces / total_elapsed) if total_elapsed else 0.0
+
+    def _autotune_multiplier(
+        self,
+        last_buf,
+        expected_buf,
+        found_nonce_buf,
+        found_flag_buf,
+        last_len: int,
+    ) -> None:
+        if self.autotune_done or self.batch_multiplier_override:
+            return
+
+        plateau_tolerance = 0.05
+        max_multiplier = 12.0
+        step = 1.0
+
+        best_multiplier = self.batch_multiplier
+        best_rate = 0.0
+        multiplier = self.batch_multiplier
+
+        while multiplier <= max_multiplier:
+            rate = self._benchmark_multiplier(
+                multiplier,
+                last_buf,
+                expected_buf,
+                found_nonce_buf,
+                found_flag_buf,
+                last_len,
+            )
+            if rate > best_rate * (1 + plateau_tolerance):
+                best_rate = rate
+                best_multiplier = multiplier
+                multiplier += step
+            else:
+                break
+
+        if best_multiplier != self.batch_multiplier:
+            print(
+                f"Auto-tuned batch multiplier to {best_multiplier} "
+                f"(batch size {self._batch_size_for_multiplier(best_multiplier)})",
+                file=sys.stderr,
+            )
+        self.batch_multiplier = best_multiplier
+        self.autotune_done = True
+        self._update_batch_size()
 
     def solve_job(self, last_hash: str, expected: str, difficulty: int) -> Tuple[int, float, float]:
         if not isinstance(expected, str):
@@ -383,6 +490,14 @@ class GpuHasher:
         )
         found_nonce_buf = cl.Buffer(self.context, mf.WRITE_ONLY, size=4)
         found_flag_buf = cl.Buffer(self.context, mf.READ_WRITE, size=4)
+
+        self._autotune_multiplier(
+            last_buf,
+            expected_buf,
+            found_nonce_buf,
+            found_flag_buf,
+            len(last_bytes),
+        )
 
         nonce_limit = int(difficulty) * 100 + 1
         start_nonce = 0
@@ -528,6 +643,16 @@ def parse_args(
         default=None,
         help="Override kernel work group size (default: auto-detected)",
     )
+    parser.add_argument(
+        "--batch-multiplier",
+        type=float,
+        dest="batch_multiplier",
+        default=None,
+        help=(
+            "Scale batch size beyond compute_units*2 (default: auto + autotune). "
+            "Higher values increase queued nonces; lower values reduce latency."
+        ),
+    )
     parser.add_argument("--username", type=str, default=None, help="Wallet username override")
     parser.add_argument(
         "--mining-key",
@@ -571,9 +696,15 @@ def parse_args(
         if args.work_size is None and work_size_fallback is not None:
             args.work_size = section.getint("work_size")
 
+        batch_mult_fallback = section.get("batch_multiplier", fallback=None)
+        if args.batch_multiplier is None and batch_mult_fallback is not None:
+            args.batch_multiplier = section.getfloat("batch_multiplier")
+
     args.backend = (args.backend or "opencl").lower()
     if args.work_size is not None and args.work_size <= 0:
         raise SystemExit("Work size must be a positive integer.")
+    if args.batch_multiplier is not None and args.batch_multiplier <= 0:
+        raise SystemExit("Batch multiplier must be a positive number.")
 
     missing = [field for field in ("username",) if not getattr(args, field)]
     if missing:
@@ -650,7 +781,7 @@ def mine(args: argparse.Namespace) -> None:
         )
 
     device = devices[device_index]
-    hasher = GpuHasher(device, args.work_size)
+    hasher = GpuHasher(device, args.work_size, args.batch_multiplier)
 
     print(
         f"Using GPU device: {device.name} (platform: {device.platform.name})",

@@ -27,17 +27,28 @@ The miner will prompt for configuration details on first launch and downloads la
    Make sure your GPU drivers expose an OpenCL runtime/ICD; without drivers PyOpenCL cannot discover devices.
 2. Run the GPU miner (it will reuse your PC miner username/mining key unless overridden):
    ```bash
-   python3 GPU_Miner.py --backend opencl --device 0 --work-size 128
+   # Auto-tunes work group size and batch sizing; overrides are optional:
+   python3 GPU_Miner.py --backend opencl --device 0
+   # Advanced overrides:
+   python3 GPU_Miner.py --backend opencl --device 0 --work-size 256 --batch-multiplier 3
    ```
-   CLI flags are optional; omit them to use the first detected GPU and auto-detected kernel work sizes. Any CLI option takes precedence over configuration files.
+   CLI flags are optional; omit them to use the first detected GPU and auto-detected kernel work sizes and batch sizes. The miner will auto-tune batch sizing per session unless a multiplier is provided. Any CLI option takes precedence over configuration files.
 3. (Optional) Save defaults in `GPU_Settings.cfg`:
    ```ini
    [GPU Miner]
    backend = opencl
    device = 0
-   work_size = 128
+   # Preferred work group size (auto-selects 512/1024 when supported)
+   work_size = 256
+   # Scale batches beyond compute_units*2; leave unset to auto-tune
+   batch_multiplier = 3
    ```
    Place this file inside `Duino-Coin PC Miner 4.3/` alongside `Settings.cfg`. If both `GPU_Settings.cfg` and CLI options are present, CLI values win.
+
+### GPU batch sizing defaults
+- **Discrete NVIDIA/AMD (e.g., RTX 20xx/30xx, RX 5000/6000):** auto-detected work groups usually pick 512–1024; start with `--batch-multiplier 2` (default) and let autotune raise it if the device remains underutilized.
+- **Integrated GPUs (Intel/AMD iGPU):** work groups often cap at 256; keep the default multiplier or lower it (`--batch-multiplier 1`) if you see driver resets or throttling.
+- The miner clamps batch sizes to each device's `MAX_WORK_ITEM_SIZES[0]` and stops increasing the multiplier once throughput gains plateau to reduce instability on marginal devices.
 
 ### Troubleshooting GPU startup
 - **Missing PyOpenCL:** install it manually as shown above. Auto-installation is disabled for GPU packages to avoid driver conflicts.
