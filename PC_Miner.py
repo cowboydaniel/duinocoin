@@ -40,7 +40,7 @@ from platform import python_version_tuple
 from platform import python_version
 
 from signal import SIGINT, signal
-from locale import getdefaultlocale
+import locale
 from configparser import ConfigParser
 
 import io
@@ -92,6 +92,20 @@ def debug_output(text: str):
         print(Style.RESET_ALL + Fore.WHITE
               + now().strftime(Style.DIM + '%H:%M:%S.%f ')
               + Style.NORMAL + f'DEBUG: {text}')
+
+
+def get_system_locale():
+    """
+    Retrieve the system locale without using the deprecated getdefaultlocale.
+    """
+    try:
+        locale.setlocale(locale.LC_CTYPE, "")
+        language, _ = locale.getlocale()
+        if language:
+            return language
+    except Exception as exc:
+        debug_output(f"Could not determine system locale: {exc}")
+    return ""
 
 
 def install(package):
@@ -1019,46 +1033,46 @@ class Miner:
 
         try:
             if not Path(Settings.DATA_DIR + Settings.SETTINGS_FILE).is_file():
-                locale = getdefaultlocale()[0]
-                if locale.startswith("es"):
+                locale_code = get_system_locale()
+                if locale_code.startswith("es"):
                     lang = "spanish"
-                elif locale.startswith("pl"):
+                elif locale_code.startswith("pl"):
                     lang = "polish"
-                elif locale.startswith("fr"):
+                elif locale_code.startswith("fr"):
                     lang = "french"
-                elif locale.startswith("jp"):
+                elif locale_code.startswith("jp"):
                     lang = "japanese"
-                elif locale.startswith("fa"):
+                elif locale_code.startswith("fa"):
                     lang = "farsi"
-                elif locale.startswith("mt"):
+                elif locale_code.startswith("mt"):
                     lang = "maltese"
-                elif locale.startswith("ru"):
+                elif locale_code.startswith("ru"):
                     lang = "russian"
-                elif locale.startswith("uk"):
+                elif locale_code.startswith("uk"):
                     lang = "ukrainian"
-                elif locale.startswith("de"):
+                elif locale_code.startswith("de"):
                     lang = "german"
-                elif locale.startswith("tr"):
+                elif locale_code.startswith("tr"):
                     lang = "turkish"
-                elif locale.startswith("pr"):
+                elif locale_code.startswith("pr"):
                     lang = "portuguese"
-                elif locale.startswith("it"):
+                elif locale_code.startswith("it"):
                     lang = "italian"
-                elif locale.startswith("sk"):
+                elif locale_code.startswith("sk"):
                     lang = "slovak"
-                if locale.startswith("zh_TW"):
+                if locale_code.startswith("zh_TW"):
                     lang = "chinese_Traditional"
-                elif locale.startswith("zh"):
+                elif locale_code.startswith("zh"):
                     lang = "chinese_simplified"                
-                elif locale.startswith("th"):
+                elif locale_code.startswith("th"):
                     lang = "thai"
-                elif locale.startswith("ko"):
+                elif locale_code.startswith("ko"):
                     lang = "korean"
-                elif locale.startswith("id"):
+                elif locale_code.startswith("id"):
                     lang = "indonesian"
-                elif locale.startswith("cz"):
+                elif locale_code.startswith("cz"):
                     lang = "czech"
-                elif locale.startswith("fi"):
+                elif locale_code.startswith("fi"):
                     lang = "finnish"
                 else:
                     lang = "english"
