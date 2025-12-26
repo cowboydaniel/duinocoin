@@ -546,8 +546,12 @@ class GpuHasher:
         expected_buf = cl.Buffer(
             self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=expected_bytes
         )
-        found_nonce_buf = cl.Buffer(self.context, mf.WRITE_ONLY, size=4)
-        found_flag_buf = cl.Buffer(self.context, mf.READ_WRITE, size=4)
+        found_nonce_buf = cl.Buffer(
+            self.context, mf.ALLOC_HOST_PTR | mf.READ_WRITE, size=4
+        )
+        found_flag_buf = cl.Buffer(
+            self.context, mf.ALLOC_HOST_PTR | mf.READ_WRITE, size=4
+        )
 
         self._autotune_multiplier(
             last_buf,
@@ -556,26 +560,118 @@ class GpuHasher:
             found_flag_buf,
             len(last_bytes),
         )
+        mapping_supported = False
+        try:
+            probe_view, probe_event = cl.enqueue_map_buffer(
+                self.queue,
+                found_flag_buf,
+                cl.map_flags.READ | cl.map_flags.WRITE,
+                offset=0,
+                shape=(1,),
+                dtype=np.int32,
+                is_blocking=False,
+            )
+            probe_event.wait()
+            probe_view[...] = 0
+            probe_unmap = cl.enqueue_unmap_mem_object(self.queue, found_flag_buf, probe_view)
+            probe_unmap.wait()
+            mapping_supported = True
+        except Exception:
+            self.queue.finish()
+            mapping_supported = False
 
         nonce_limit = int(difficulty) * 100 + 1
         start_nonce = 0
         found_nonce = -1
         total_processed = 0
 
-        flag_hosts = [np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)]
-        nonce_host = np.zeros(1, dtype=np.uint32)
+        flag_hosts = [np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)] if not mapping_supported else None
+        nonce_host = np.zeros(1, dtype=np.uint32) if not mapping_supported else None
         pending_result = None
-        copy_wait_event = None
+        buffer_wait_event = None
         buffer_index = 0
         batch_latencies_ms = []
 
         time_start = time_ns()
         while start_nonce < nonce_limit and found_nonce == -1:
+            if pending_result:
+                if mapping_supported:
+                    (
+                        map_event,
+                        kernel_event,
+                        mapped_flag,
+                        prev_batch,
+                        prev_start,
+                        batch_start_time,
+                    ) = pending_result
+                    map_event.wait()
+                    batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
+                    found = int(mapped_flag[0]) != 0
+                    unmap_event = cl.enqueue_unmap_mem_object(
+                        self.queue,
+                        found_flag_buf,
+                        mapped_flag,
+                        wait_for=[map_event],
+                    )
+                    buffer_wait_event = unmap_event
+                    if found:
+                        nonce_map, nonce_event = cl.enqueue_map_buffer(
+                            self.queue,
+                            found_nonce_buf,
+                            cl.map_flags.READ,
+                            offset=0,
+                            shape=(1,),
+                            dtype=np.uint32,
+                            wait_for=[kernel_event],
+                            is_blocking=False,
+                        )
+                        nonce_event.wait()
+                        found_nonce = int(nonce_map[0])
+                        nonce_unmap = cl.enqueue_unmap_mem_object(
+                            self.queue,
+                            found_nonce_buf,
+                            nonce_map,
+                            wait_for=[nonce_event],
+                        )
+                        nonce_unmap.wait()
+                        total_processed = found_nonce + 1
+                        break
+                    total_processed = prev_start + prev_batch
+                else:
+                    (
+                        prev_copy,
+                        prev_kernel,
+                        prev_buffer,
+                        prev_batch,
+                        prev_start,
+                        batch_start_time,
+                    ) = pending_result
+                    prev_copy.wait()
+                    batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
+                    found = int(prev_buffer[0]) != 0
+                    if found:
+                        nonce_event = cl.enqueue_copy(
+                            self.queue,
+                            nonce_host,
+                            found_nonce_buf,
+                            wait_for=[prev_kernel],
+                            is_blocking=False,
+                        )
+                        nonce_event.wait()
+                        found_nonce = int(nonce_host[0])
+                        total_processed = found_nonce + 1
+                        break
+                    total_processed = prev_start + prev_batch
+                pending_result = None
+
+            if found_nonce != -1 or start_nonce >= nonce_limit:
+                break
+
             batch = min(self.batch_size, nonce_limit - start_nonce)
             global_size = self._global_size(batch)
             nonce_count = batch
 
-            wait_for = [copy_wait_event] if copy_wait_event else None
+            wait_for = [buffer_wait_event] if buffer_wait_event else None
             fill_event = cl.enqueue_fill_buffer(
                 self.queue,
                 found_flag_buf,
@@ -600,22 +696,102 @@ class GpuHasher:
                 (self.work_group_size,),
                 wait_for=[fill_event],
             )
-            flag_host = flag_hosts[buffer_index]
-            buffer_index ^= 1
-            copy_event = cl.enqueue_copy(
-                self.queue,
-                flag_host,
-                found_flag_buf,
-                wait_for=[kernel_event],
-                is_blocking=False,
-            )
 
-            if pending_result:
-                prev_copy, prev_kernel, prev_buffer, prev_batch, prev_start, batch_start_time = pending_result
+            if mapping_supported:
+                flag_map, map_event = cl.enqueue_map_buffer(
+                    self.queue,
+                    found_flag_buf,
+                    cl.map_flags.READ,
+                    offset=0,
+                    shape=(1,),
+                    dtype=np.int32,
+                    wait_for=[kernel_event],
+                    is_blocking=False,
+                )
+                pending_result = (
+                    map_event,
+                    kernel_event,
+                    flag_map,
+                    batch,
+                    start_nonce,
+                    time_ns(),
+                )
+                buffer_wait_event = map_event
+            else:
+                flag_host = flag_hosts[buffer_index]
+                buffer_index ^= 1
+                copy_event = cl.enqueue_copy(
+                    self.queue,
+                    flag_host,
+                    found_flag_buf,
+                    wait_for=[kernel_event],
+                    is_blocking=False,
+                )
+                pending_result = (
+                    copy_event,
+                    kernel_event,
+                    flag_host,
+                    batch,
+                    start_nonce,
+                    time_ns(),
+                )
+                buffer_wait_event = copy_event
+            start_nonce += batch
+
+        if found_nonce == -1 and pending_result:
+            if mapping_supported:
+                (
+                    map_event,
+                    kernel_event,
+                    mapped_flag,
+                    prev_batch,
+                    prev_start,
+                    batch_start_time,
+                ) = pending_result
+                map_event.wait()
+                batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
+                if int(mapped_flag[0]) != 0:
+                    nonce_map, nonce_event = cl.enqueue_map_buffer(
+                        self.queue,
+                        found_nonce_buf,
+                        cl.map_flags.READ,
+                        offset=0,
+                        shape=(1,),
+                        dtype=np.uint32,
+                        wait_for=[kernel_event],
+                        is_blocking=False,
+                    )
+                    nonce_event.wait()
+                    found_nonce = int(nonce_map[0])
+                    nonce_unmap = cl.enqueue_unmap_mem_object(
+                        self.queue,
+                        found_nonce_buf,
+                        nonce_map,
+                        wait_for=[nonce_event],
+                    )
+                    nonce_unmap.wait()
+                    total_processed = found_nonce + 1
+                else:
+                    total_processed = max(total_processed, prev_start + prev_batch)
+                unmap_event = cl.enqueue_unmap_mem_object(
+                    self.queue,
+                    found_flag_buf,
+                    mapped_flag,
+                    wait_for=[map_event],
+                )
+                unmap_event.wait()
+            else:
+                (
+                    prev_copy,
+                    prev_kernel,
+                    prev_buffer,
+                    prev_batch,
+                    prev_start,
+                    batch_start_time,
+                ) = pending_result
                 prev_copy.wait()
                 batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
-                found = int(prev_buffer[0]) != 0
-                if found:
+                if int(prev_buffer[0]) != 0:
                     nonce_event = cl.enqueue_copy(
                         self.queue,
                         nonce_host,
@@ -626,38 +802,8 @@ class GpuHasher:
                     nonce_event.wait()
                     found_nonce = int(nonce_host[0])
                     total_processed = found_nonce + 1
-                    break
-
-                total_processed = prev_start + prev_batch
-
-            pending_result = (
-                copy_event,
-                kernel_event,
-                flag_host,
-                batch,
-                start_nonce,
-                time_ns(),
-            )
-            copy_wait_event = copy_event
-            start_nonce += batch
-
-        if found_nonce == -1 and pending_result:
-            prev_copy, prev_kernel, prev_buffer, prev_batch, prev_start, batch_start_time = pending_result
-            prev_copy.wait()
-            batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
-            if int(prev_buffer[0]) != 0:
-                nonce_event = cl.enqueue_copy(
-                    self.queue,
-                    nonce_host,
-                    found_nonce_buf,
-                    wait_for=[prev_kernel],
-                    is_blocking=False,
-                )
-                nonce_event.wait()
-                found_nonce = int(nonce_host[0])
-                total_processed = found_nonce + 1
-            else:
-                total_processed = max(total_processed, prev_start + prev_batch)
+                else:
+                    total_processed = max(total_processed, prev_start + prev_batch)
 
         if batch_latencies_ms:
             avg_latency = sum(batch_latencies_ms) / len(batch_latencies_ms)
