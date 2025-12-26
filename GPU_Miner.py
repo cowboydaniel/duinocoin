@@ -326,7 +326,7 @@ class GpuHasher:
         self.batch_multiplier = float(batch_multiplier) if batch_multiplier else 2.0
         self.autotune_max_multiplier_override = autotune_max_multiplier
         self.autotune_samples = (
-            autotune_samples if autotune_samples is not None else 5
+            autotune_samples if autotune_samples is not None else 10
         )
         if self.autotune_samples < 2:
             self.autotune_samples = 2
@@ -453,16 +453,13 @@ class GpuHasher:
 
     def _max_autotune_multiplier(self) -> float:
         if self.autotune_max_multiplier_override:
-            return max(1.0, float(self.autotune_max_multiplier_override))
+            return max(1.0, min(60.0, float(self.autotune_max_multiplier_override)))
 
         if not self.work_group_size or not self.max_items_dim0:
-            return 12.0
+            return 60.0
 
         theoretical_cap = (self.max_items_dim0 * 8) / float(self.work_group_size)
-        compute_factor = max(1.0, float(self.compute_units or 1))
-        workgroup_factor = max(1.0, float(self.max_group) / float(self.work_group_size))
-        adaptive_limit = 4.0 * compute_factor * workgroup_factor
-        bounded_limit = min(theoretical_cap, max(12.0, adaptive_limit))
+        bounded_limit = min(theoretical_cap, 60.0)
         if bounded_limit <= 0:
             return 1.0
         if theoretical_cap < 1.0:
@@ -936,7 +933,7 @@ def parse_args(
         type=int,
         dest="autotune_samples",
         default=None,
-        help="Micro-benchmark samples per multiplier during autotune (default: 5).",
+        help="Micro-benchmark samples per multiplier during autotune (default: 10).",
     )
     parser.add_argument(
         "--autotune-min-delta-scale",
