@@ -108,6 +108,29 @@ def get_system_locale():
     return ""
 
 
+def normalize_start_diff(value):
+    """
+    Ensure the configured starting difficulty matches the values accepted by
+    Duino-Coin nodes. Any unexpected input falls back to MEDIUM to avoid
+    "Too low/high starting difficulty" errors.
+    """
+    try:
+        cleaned = str(value).strip().upper()
+    except Exception:
+        cleaned = ""
+
+    mapping = {
+        "1": "LOW",
+        "LOW": "LOW",
+        "2": "MEDIUM",
+        "MEDIUM": "MEDIUM",
+        "3": "NET",
+        "NET": "NET"
+    }
+
+    return mapping.get(cleaned, "MEDIUM")
+
+
 def install(package):
     """
     Automatically installs python pip package and restarts the program
@@ -1157,15 +1180,13 @@ class Miner:
                   + "2" + Style.NORMAL + " - " + get_string("medium_diff")
                   + "\n" + Style.BRIGHT
                   + "3" + Style.NORMAL + " - " + get_string("net_diff"))
-            start_diff = sub(r"\D", "",
-                             input(Style.NORMAL + get_string("ask_difficulty")
-                                   + Style.BRIGHT))
-            if start_diff == "1":
-                start_diff = "LOW"
-            elif start_diff == "3":
-                start_diff = "NET"
-            else:
-                start_diff = "MEDIUM"
+            start_diff = normalize_start_diff(
+                sub(
+                    r"\D",
+                    "",
+                    input(
+                        Style.NORMAL + get_string("ask_difficulty")
+                        + Style.BRIGHT)))
 
             rig_id = input(Style.NORMAL + get_string("ask_rig_identifier")
                            + Style.BRIGHT)
@@ -1200,7 +1221,7 @@ class Miner:
                 "mining_key":    mining_key,
                 "intensity":     intensity,
                 "threads":       threads,
-                "start_diff":    start_diff,
+                "start_diff":    normalize_start_diff(start_diff),
                 "donate":        int(donation_level),
                 "identifier":    rig_id,
                 "algorithm":     algorithm,
@@ -1221,6 +1242,11 @@ class Miner:
                           + Settings.SETTINGS_FILE)
         if "performance_log" not in configparser["PC Miner"]:
             configparser["PC Miner"]["performance_log"] = "n"
+        if "start_diff" in configparser["PC Miner"]:
+            configparser["PC Miner"]["start_diff"] = normalize_start_diff(
+                configparser["PC Miner"]["start_diff"])
+        else:
+            configparser["PC Miner"]["start_diff"] = "MEDIUM"
         return configparser["PC Miner"]
 
     def m_connect(id, pool):
