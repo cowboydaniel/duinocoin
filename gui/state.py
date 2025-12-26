@@ -49,6 +49,8 @@ class Configuration:
     server: str = "server.duinocoin.com"
     port: int = 2813
     auto_start: bool = False
+    wallet_username: str = ""
+    wallet_token: str = ""
 
 
 class AppState(QObject):
@@ -107,4 +109,3 @@ class AppState(QObject):
     def update_config(self, **updates) -> None:
         self.config = replace(self.config, **updates)
         self.config_changed.emit(self.config)
-
