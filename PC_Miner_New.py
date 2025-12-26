@@ -13,8 +13,7 @@ from socket import socket
 from multiprocessing import cpu_count, current_process
 from multiprocessing import Process, Manager, Semaphore
 from multiprocessing import Array, Value
-from threading import Thread, Lock, Event
-from queue import Queue, Empty
+from threading import Thread, Lock
 from collections import defaultdict
 from datetime import datetime
 from random import randint
@@ -1324,10 +1323,6 @@ class Miner:
         current_pool = pool
         last_pool_switch = time()
 
-        # Prefetcher settings
-        PREFETCH_LIMIT = 2
-        PREFETCH_BACKOFF = 1.0
-
         def _efficiency_from_intensity(intensity: int):
             if 99 > intensity >= 90:
                 return 0.005
@@ -1404,211 +1399,179 @@ class Miner:
         while True:
             local_accept = 0
             local_reject = 0
-            job_queue = Queue(maxsize=PREFETCH_LIMIT)
-            prefetch_stop = Event()
-            socket_lock = Lock()
-            prefetch_error = {"err": None}
-            prefetch_thread = None
             try:
                 Miner.m_connect(id, current_pool)
+                while True:
+                    try:
+                        if user_settings["mining_key"] != "None":
+                            key = b64.b64decode(user_settings["mining_key"]).decode('utf-8')
+                        else:
+                            key = user_settings["mining_key"]
 
-                def job_prefetcher():
-                    nonlocal prefetch_error
-                    while not prefetch_stop.is_set():
-                        if job_queue.full():
-                            sleep(0.05)
-                            continue
-                        try:
-                            if user_settings["mining_key"] != "None":
-                                key = b64.b64decode(user_settings["mining_key"]).decode('utf-8')
-                            else:
-                                key = user_settings["mining_key"]
+                        raspi_iot_reading = ""
+                        if user_settings["raspi_cpu_iot"] == "y" and running_on_rpi:
+                            raspi_iot_reading = f"CPU temperature:{get_rpi_temperature()}*C"
 
-                            raspi_iot_reading = ""
-                            if user_settings["raspi_cpu_iot"] == "y" and running_on_rpi:
-                                # * instead of the degree symbol because nodes use basic encoding
-                                raspi_iot_reading = f"CPU temperature:{get_rpi_temperature()}*C"
+                        # Request job from server (sequential, no prefetching)
+                        while True:
+                            Client.send("JOB"
+                                        + Settings.SEPARATOR
+                                        + str(user_settings["username"])
+                                        + Settings.SEPARATOR
+                                        + str(user_settings["start_diff"])
+                                        + Settings.SEPARATOR
+                                        + str(key)
+                                        + Settings.SEPARATOR
+                                        + str(raspi_iot_reading))
 
-                            with socket_lock:
-                                Client.send("JOB"
-                                            + Settings.SEPARATOR
-                                            + str(user_settings["username"])
-                                            + Settings.SEPARATOR
-                                            + str(user_settings["start_diff"])
-                                            + Settings.SEPARATOR
-                                            + str(key)
-                                            + Settings.SEPARATOR
-                                            + str(raspi_iot_reading))
-
-                                job = Client.recv().split(Settings.SEPARATOR)
+                            job = Client.recv().split(Settings.SEPARATOR)
                             if len(job) == 3:
-                                job_queue.put(job)
+                                break
                             else:
                                 pretty_print(
                                     "Node message: " + str(job[1]),
                                     "warning", print_queue=print_queue)
-                                sleep(PREFETCH_BACKOFF)
-                        except Exception as e:
-                            prefetch_error["err"] = e
-                            prefetch_stop.set()
-                            break
+                                sleep(3)
 
-                prefetch_thread = Thread(target=job_prefetcher, daemon=True)
-                prefetch_thread.start()
+                        while True:
+                            time_start = time()
+                            back_color = Back.YELLOW
+                            eff = _efficiency_from_intensity(int(current_intensity))
 
-                while not prefetch_stop.is_set():
-                    try:
-                        job = job_queue.get(timeout=Settings.SOC_TIMEOUT)
-                    except Empty:
-                        if prefetch_error["err"]:
-                            raise prefetch_error["err"]
-                        continue
+                            result = Algorithms.DUCOS1(
+                                job[0], job[1], int(job[2]), eff)
+                            computetime = time() - time_start
 
-                    time_start = time()
-                    back_color = Back.YELLOW
-                    eff = _efficiency_from_intensity(int(current_intensity))
+                            hashrate_array[id] = result[1]
+                            prep_identifier = user_settings['identifier']
+                            if running_on_rpi:
+                                if prep_identifier != "None":
+                                    prep_identifier += " - RPi"
+                                else:
+                                    prep_identifier = "Raspberry Pi"
 
-                    result = Algorithms.DUCOS1(
-                        job[0], job[1], int(job[2]), eff)
-                    computetime = time() - time_start
+                            while True:
+                                Client.send(f"{result[0]}"
+                                            + Settings.SEPARATOR
+                                            + f"{result[1]}"
+                                            + Settings.SEPARATOR
+                                            + "Official PC Miner"
+                                            + f" {Settings.VER}"
+                                            + Settings.SEPARATOR
+                                            + f"{prep_identifier}"
+                                            + Settings.SEPARATOR
+                                            + Settings.SEPARATOR
+                                            + f"{single_miner_id}")
 
-                    hashrate_array[id] = result[1]
-                    prep_identifier = user_settings['identifier']
-                    if running_on_rpi:
-                        if prep_identifier != "None":
-                            prep_identifier += " - RPi"
-                        else:
-                            prep_identifier = "Raspberry Pi"
+                                time_start = time()
+                                feedback = Client.recv().split(Settings.SEPARATOR)
+                                ping = (time() - time_start) * 1000
 
-                    with socket_lock:
-                        Client.send(f"{result[0]}"
-                                    + Settings.SEPARATOR
-                                    + f"{result[1]}"
-                                    + Settings.SEPARATOR
-                                    + "Official PC Miner"
-                                    + f" {Settings.VER}"
-                                    + Settings.SEPARATOR
-                                    + f"{prep_identifier}"
-                                    + Settings.SEPARATOR
-                                    + Settings.SEPARATOR
-                                    + f"{single_miner_id}")
+                                recent_pings.append(ping)
+                                if len(recent_pings) > 30:
+                                    recent_pings.pop(0)
+                                _update_pool_latency(current_pool, ping)
 
-                        time_start = time()
-                        feedback = Client.recv().split(Settings.SEPARATOR)
-                    ping = (time() - time_start) * 1000
-                    recent_pings.append(ping)
-                    if len(recent_pings) > 30:
-                        recent_pings.pop(0)
-                    _update_pool_latency(current_pool, ping)
+                                if feedback[0] == "GOOD":
+                                    local_accept += 1
+                                    share_print(id, "accept",
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                                computetime, job[2], ping,
+                                                back_color,
+                                                print_queue=print_queue)
 
-                    if feedback[0] == "GOOD":
-                        local_accept += 1
-                        share_print(id, "accept",
-                                    local_accept, local_reject,
-                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                    computetime, job[2], ping,
-                                    back_color,
-                                    print_queue=print_queue)
+                                elif feedback[0] == "BLOCK":
+                                    local_accept += 1
+                                    blocks.value += 1
+                                    share_print(id, "block",
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                                computetime, job[2], ping,
+                                                back_color,
+                                                print_queue=print_queue)
 
-                    elif feedback[0] == "BLOCK":
-                        local_accept += 1
-                        blocks.value += 1
-                        share_print(id, "block",
-                                    local_accept, local_reject,
-                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                    computetime, job[2], ping,
-                                    back_color,
-                                    print_queue=print_queue)
+                                elif feedback[0] == "BAD":
+                                    local_reject += 1
+                                    pool_metrics[current_pool]["errors"] += 1
+                                    share_print(id, "reject",
+                                                local_accept, local_reject,
+                                                result[1], cached_totals["hashrate"] if cached_totals else result[1],
+                                                computetime, job[2], ping,
+                                                back_color, feedback[1],
+                                                print_queue=print_queue)
 
-                    elif feedback[0] == "BAD":
-                        local_reject += 1
-                        pool_metrics[current_pool]["errors"] += 1
-                        share_print(id, "reject",
-                                    local_accept, local_reject,
-                                    result[1], cached_totals["hashrate"] if cached_totals else result[1],
-                                    computetime, job[2], ping,
-                                    back_color, feedback[1],
-                                    print_queue=print_queue)
+                                flush_shares += 1
+                                shares_since_cache += 1
+                                if (flush_shares >= FLUSH_INTERVAL_SHARES
+                                    or time() - last_flush >= FLUSH_INTERVAL_SEC):
+                                    accept_counts[id] = local_accept
+                                    reject_counts[id] = local_reject
+                                    last_flush = time()
+                                    flush_shares = 0
 
-                    flush_shares += 1
-                    shares_since_cache += 1
-                    if (flush_shares >= FLUSH_INTERVAL_SHARES
-                        or time() - last_flush >= FLUSH_INTERVAL_SEC):
-                        accept_counts[id] = local_accept
-                        reject_counts[id] = local_reject
-                        last_flush = time()
-                        flush_shares = 0
-
-                    cached_totals, shares_since_cache = refresh_cached_totals(
-                        cached_totals, shares_since_cache,
-                        hashrate_array, accept_counts,
-                        reject_counts)
-
-                    if (cached_totals
-                        and cached_totals["accept"] % 100 == 0
-                        and cached_totals["accept"] > 1):
-                        pretty_print(
-                            f"{get_string('surpassed')} {cached_totals['accept']} {get_string('surpassed_shares')}",
-                            "success", "sys0", print_queue=print_queue)
-
-                    _update_title()
-                    _tune_intensity()
-
-                    if id == 0:
-                        end_time = time()
-                        elapsed_time = end_time - last_report
-                        if elapsed_time >= int(user_settings["report_sec"]):
-                            if cached_totals is None:
                                 cached_totals, shares_since_cache = refresh_cached_totals(
                                     cached_totals, shares_since_cache,
                                     hashrate_array, accept_counts,
                                     reject_counts)
-                            r_shares = cached_totals["accept"] - last_shares
-                            uptime = calculate_uptime(
-                                mining_start_time)
-                            periodic_report(last_report, end_time,
-                                            r_shares, blocks.value,
-                                            cached_totals["hashrate"],
-                                            uptime,
-                                            current_intensity)
-                            last_report = time()
-                            last_shares = cached_totals["accept"]
 
-                    avg_ping = sum(recent_pings) / len(recent_pings) if recent_pings else 0
-                    if _should_switch_pool(avg_ping):
-                        try:
-                            new_pool = Client.fetch_pool()
-                            pool_metrics[new_pool]  # initialize
-                            best_pool = _choose_best_pool()
-                            if best_pool != current_pool:
-                                current_pool = best_pool
-                            else:
-                                current_pool = new_pool
-                            last_pool_switch = time()
-                            prefetch_stop.set()
+                                if (cached_totals
+                                    and cached_totals["accept"] % 100 == 0
+                                    and cached_totals["accept"] > 1):
+                                    pretty_print(
+                                        f"{get_string('surpassed')} {cached_totals['accept']} {get_string('surpassed_shares')}",
+                                        "success", "sys0", print_queue=print_queue)
+
+                                _update_title()
+                                _tune_intensity()
+
+                                if id == 0:
+                                    end_time = time()
+                                    elapsed_time = end_time - last_report
+                                    if elapsed_time >= int(user_settings["report_sec"]):
+                                        if cached_totals is None:
+                                            cached_totals, shares_since_cache = refresh_cached_totals(
+                                                cached_totals, shares_since_cache,
+                                                hashrate_array, accept_counts,
+                                                reject_counts)
+                                        r_shares = cached_totals["accept"] - last_shares
+                                        uptime = calculate_uptime(
+                                            mining_start_time)
+                                        periodic_report(last_report, end_time,
+                                                        r_shares, blocks.value,
+                                                        cached_totals["hashrate"],
+                                                        uptime,
+                                                        current_intensity)
+                                        last_report = time()
+                                        last_shares = cached_totals["accept"]
+
+                                avg_ping = sum(recent_pings) / len(recent_pings) if recent_pings else 0
+                                if _should_switch_pool(avg_ping):
+                                    try:
+                                        new_pool = Client.fetch_pool()
+                                        pool_metrics[new_pool]  # initialize
+                                        best_pool = _choose_best_pool()
+                                        if best_pool != current_pool:
+                                            current_pool = best_pool
+                                        else:
+                                            current_pool = new_pool
+                                        last_pool_switch = time()
+                                    except Exception:
+                                        pass
+                                break
                             break
-                        except Exception:
-                            pass
-
-                    if prefetch_error["err"]:
-                        raise prefetch_error["err"]
-            except Exception as e:
-                pretty_print(get_string("error_while_mining")
+                    except Exception as e:
+                        pretty_print(get_string("error_while_mining")
                                      + " " + str(e), "error", "net" + str(id),
                                      print_queue=print_queue)
+                        sleep(5)
+                        break
+            except Exception as e:
+                pretty_print(get_string("error_while_mining")
+                             + " " + str(e), "error", "net" + str(id),
+                             print_queue=print_queue)
                 pool_metrics[current_pool]["errors"] += 1
                 sleep(5)
-            finally:
-                prefetch_stop.set()
-                try:
-                    if prefetch_thread:
-                        prefetch_thread.join(timeout=2)
-                except Exception:
-                    pass
-                try:
-                    s.close()
-                except Exception:
-                    pass
 
 
 class Discord_rp:
