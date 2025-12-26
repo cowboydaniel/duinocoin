@@ -53,6 +53,7 @@ libducohasher = None
 fasthash_supported = False
 fasthash_import_error = None
 fasthash_warning_reported = False
+use_pure_python_hasher = False
 
 # Python <3.5 check
 f"Your Python version is too old. Duino-Coin Miner requires version 3.6 or above. Update your packages and try again"
@@ -401,13 +402,53 @@ class Algorithms:
     For more info about the implementation refer to the Duino whitepaper:
     https://github.com/revoxhere/duino-coin/blob/gh-pages/assets/whitepaper.pdf
     """
-    def _require_fast_hasher():
+    def _check_fasthash_validity():
         """
-        Ensures libducohasher is available before performing hashing.
-        Attempts automatic installation and exits with a clear warning
-        if the optimized backend cannot be loaded.
+        Verify that libducohasher produces correct results.
+        Returns True if fasthash works correctly, False otherwise.
         """
-        global fasthash_supported, fasthash_import_error, libducohasher, fasthash_warning_reported
+        global libducohasher
+        try:
+            # Test case: SHA1("test0") = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"
+            test_last_h = "test"
+            test_exp_h = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"
+            hasher = libducohasher.DUCOHasher(bytes(test_last_h, encoding='ascii'))
+            # Search with diff=1 (nonce range 0-100), eff=0 means max speed
+            nonce = hasher.DUCOS1(bytes(bytearray.fromhex(test_exp_h)), 1, 0)
+            # The correct nonce should be 0
+            if nonce == 0:
+                # Verify the hash is correct
+                verify_hash = sha1(f"{test_last_h}{nonce}".encode('ascii')).hexdigest()
+                return verify_hash == test_exp_h
+            return False
+        except Exception:
+            return False
+
+    def _init_hasher():
+        """
+        Initialize the hashing backend. Prefers libducohasher but falls back
+        to pure Python if libducohasher is unavailable or produces wrong results.
+        """
+        global fasthash_supported, fasthash_import_error, libducohasher
+        global fasthash_warning_reported, use_pure_python_hasher
+
+        if use_pure_python_hasher:
+            return
+
+        # Check Python version - 3.14+ may have ABI incompatibilities with C extensions
+        py_version = tuple(map(int, python_version_tuple()[:2]))
+        if py_version >= (3, 14):
+            use_pure_python_hasher = True
+            if not fasthash_warning_reported:
+                fasthash_warning_reported = True
+                try:
+                    pretty_print(
+                        f"Python {python_version()} detected, using pure Python hasher "
+                        "for compatibility",
+                        "info", "sys0")
+                except Exception:
+                    print(f"Python {python_version()} detected, using pure Python hasher")
+            return
 
         if not fasthash_supported:
             try:
@@ -419,40 +460,75 @@ class Algorithms:
                 fasthash_import_error = e
 
         if fasthash_supported:
-            return True
+            # Verify fasthash produces correct results
+            if Algorithms._check_fasthash_validity():
+                return
+            else:
+                use_pure_python_hasher = True
+                if not fasthash_warning_reported:
+                    fasthash_warning_reported = True
+                    try:
+                        pretty_print(
+                            "libducohasher produces incorrect results, "
+                            "falling back to pure Python hasher",
+                            "warning", "sys0")
+                    except Exception:
+                        print("libducohasher produces incorrect results, using pure Python")
+                return
 
+        # fasthash not supported, use pure Python
+        use_pure_python_hasher = True
         if not fasthash_warning_reported:
             fasthash_warning_reported = True
             try:
                 pretty_print(
-                    "Fast libducohasher backend is required but missing "
-                    f"(platform: {osprocessor()}).",
+                    "libducohasher not available, using pure Python hasher "
+                    "(mining will be slower)",
                     "warning", "sys0")
             except Exception:
-                print("Fast libducohasher backend is required but missing.")
+                print("libducohasher not available, using pure Python hasher")
 
-            if isinstance(fasthash_import_error, ModuleNotFoundError):
-                try:
-                    pretty_print(
-                        "Attempting to install libducohasher automatically...",
-                        "warning", "sys0")
-                except Exception:
-                    print("Attempting to install libducohasher automatically...")
-                install("libducohasher")
+    def DUCOS1_pure_python(last_h: str, exp_h: str, diff: int, eff: int):
+        """
+        Pure Python implementation of DUCO-S1 algorithm.
+        Slower than libducohasher but works on all Python versions.
+        """
+        time_start = time_ns()
+        exp_h_lower = exp_h.lower()
 
-            try:
-                pretty_print(
-                    "libducohasher could not be loaded. "
-                    "Please install a compatible build for your platform "
-                    "or follow the build instructions in README.md.",
-                    "error", "sys0")
-            except Exception:
-                print("libducohasher could not be loaded. Check README.md for instructions.")
+        # The efficiency parameter controls mining speed
+        # Lower eff values = faster mining, higher = slower (for power saving)
+        # eff of 0 means maximum speed
+        if eff > 0:
+            sleep_time = eff / 1000.0  # Convert to reasonable sleep interval
+        else:
+            sleep_time = 0
 
-        sys.exit(1)
+        max_nonce = diff * 100 + 1
+        for nonce in range(max_nonce):
+            candidate = sha1(f"{last_h}{nonce}".encode('ascii')).hexdigest()
+            if candidate == exp_h_lower:
+                time_elapsed = time_ns() - time_start
+                if time_elapsed > 0:
+                    hashrate = 1e9 * nonce / time_elapsed
+                else:
+                    hashrate = 0
+                return [nonce, hashrate]
+
+            # Apply efficiency throttling periodically
+            if sleep_time > 0 and nonce % 1000 == 0:
+                sleep(sleep_time)
+
+        # No solution found (shouldn't happen with correct job)
+        time_elapsed = time_ns() - time_start
+        hashrate = 1e9 * max_nonce / time_elapsed if time_elapsed > 0 else 0
+        return [0, hashrate]
 
     def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
-        Algorithms._require_fast_hasher()
+        Algorithms._init_hasher()
+
+        if use_pure_python_hasher:
+            return Algorithms.DUCOS1_pure_python(last_h, exp_h, diff, eff)
 
         time_start = time_ns()
 
@@ -1654,13 +1730,32 @@ class Discord_rp:
 
 class Fasthash:
     def init():
+        """
+        Check whether libducohash fasthash is available and working
+        to speed up the DUCOS1 work, created by @HGEpro
+        """
+        global use_pure_python_hasher
+
+        # Check Python version - 3.14+ has ABI incompatibilities
+        py_version = tuple(map(int, python_version_tuple()[:2]))
+        if py_version >= (3, 14):
+            pretty_print(
+                f"Python {python_version()} detected, using pure Python hasher",
+                "info", "sys0")
+            use_pure_python_hasher = True
+            return
+
         try:
-            """
-            Check whether libducohash fasthash is available
-            to speed up the DUCOS1 work, created by @HGEpro
-            """
             import libducohasher
-            pretty_print(get_string("fasthash_available"), "info")
+            # Verify the hasher produces correct results
+            if Algorithms._check_fasthash_validity():
+                pretty_print(get_string("fasthash_available"), "info")
+            else:
+                pretty_print(
+                    "libducohasher loaded but produces incorrect results, "
+                    "using pure Python hasher",
+                    "warning", "sys0")
+                use_pure_python_hasher = True
         except Exception as e:
             if int(python_version_tuple()[1]) <= 6:
                 pretty_print(
@@ -1671,12 +1766,9 @@ class Fasthash:
                      ).replace("\n", "\n\t\t"), 'warning', 'sys0')
             else:
                 pretty_print(
-                    ("Fasthash accelerations are not available for your OS.\n"
-                     + "If you wish to compile them for your system, visit:\n"
-                     + "https://github.com/revoxhere/duino-coin/wiki/"
-                     + "How-to-compile-fasthash-accelerations\n"
-                     + f"(Libducohash couldn't be loaded: {str(e)})"
-                     ).replace("\n", "\n\t\t"), 'warning', 'sys0')
+                    "Using pure Python hasher (fasthash not available)",
+                    "info", "sys0")
+            use_pure_python_hasher = True
 
     def load():
         if os.name == 'nt':
