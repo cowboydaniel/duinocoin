@@ -494,34 +494,22 @@ class Algorithms:
         Slower than libducohasher but works on all Python versions.
         """
         time_start = time_ns()
-
-        # Strip whitespace and normalize
-        last_h = last_h.strip()
-        exp_h = exp_h.strip().lower()
-
-        # Debug output
-        print(f"DEBUG: last_h='{last_h}' (len={len(last_h)})")
-        print(f"DEBUG: exp_h='{exp_h}' (len={len(exp_h)})")
-        print(f"DEBUG: diff={diff}, eff={eff}, max_nonce={diff * 100 + 1}")
+        exp_h_lower = exp_h.lower()
 
         max_nonce = diff * 100 + 1
         for nonce in range(max_nonce):
             candidate = sha1(f"{last_h}{nonce}".encode('ascii')).hexdigest()
-            if candidate == exp_h:
+            if candidate == exp_h_lower:
                 time_elapsed = time_ns() - time_start
                 if time_elapsed > 0:
                     hashrate = 1e9 * nonce / time_elapsed
                 else:
                     hashrate = 0
-                print(f"DEBUG: Found nonce={nonce}, hash={candidate}")
                 return [nonce, hashrate]
 
-        # No solution found
+        # No solution found (shouldn't happen with correct job)
         time_elapsed = time_ns() - time_start
         hashrate = 1e9 * max_nonce / time_elapsed if time_elapsed > 0 else 0
-        # Show what hash we computed for nonce 0
-        test_hash = sha1(f"{last_h}0".encode('ascii')).hexdigest()
-        print(f"DEBUG: No match found! hash(nonce=0)={test_hash}")
         return [0, hashrate]
 
     def DUCOS1(last_h: str, exp_h: str, diff: int, eff: int):
@@ -1743,6 +1731,8 @@ class Fasthash:
                 f"Python {python_version()} detected, using pure Python hasher",
                 "info", "sys0")
             use_pure_python_hasher = True
+            # Force LOW difficulty for pure Python hasher
+            Fasthash._set_low_difficulty()
             return
 
         try:
@@ -1756,6 +1746,7 @@ class Fasthash:
                     "using pure Python hasher",
                     "warning", "sys0")
                 use_pure_python_hasher = True
+                Fasthash._set_low_difficulty()
         except Exception as e:
             if int(python_version_tuple()[1]) <= 6:
                 pretty_print(
@@ -1769,6 +1760,22 @@ class Fasthash:
                     "Using pure Python hasher (fasthash not available)",
                     "info", "sys0")
             use_pure_python_hasher = True
+            Fasthash._set_low_difficulty()
+
+    def _set_low_difficulty():
+        """
+        Set difficulty to LOW when using pure Python hasher.
+        The pure Python implementation is slower and may timeout on higher difficulties.
+        """
+        global user_settings
+        try:
+            if user_settings.get("start_diff", "MEDIUM") != "LOW":
+                user_settings["start_diff"] = "LOW"
+                pretty_print(
+                    "Difficulty set to LOW for pure Python hasher compatibility",
+                    "info", "sys0")
+        except Exception:
+            pass  # user_settings not yet initialized
 
     def load():
         if os.name == 'nt':
