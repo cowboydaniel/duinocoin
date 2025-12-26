@@ -8,8 +8,12 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
+
+from .config import Configuration, load_config, save_config, validate_config
 
 
 @dataclass
@@ -37,6 +41,28 @@ class MinerStatus:
 
 
 @dataclass
+class MinerMetrics:
+    """Normalized metrics derived from miner stdout."""
+
+    hashrate: float = 0.0
+    share_rate_per_min: float = 0.0
+    accepted_shares: int = 0
+    rejected_shares: int = 0
+    rewards_duco: float = 0.0
+    projected_duco_per_day: float = 0.0
+    temperature_c: Optional[float] = None
+    last_error: Optional[str] = None
+
+
+@dataclass
+class MinerLogEntry:
+    """A recent message emitted by the miner processes."""
+
+    level: str
+    message: str
+
+
+@dataclass
 class LiveStats:
     """Aggregated statistics about the mining session."""
 
@@ -56,6 +82,8 @@ class Configuration:
     server: str = "server.duinocoin.com"
     port: int = 2813
     auto_start: bool = False
+    wallet_username: str = ""
+    wallet_token: str = ""
 
 
 @dataclass
@@ -77,6 +105,8 @@ class AppState(QObject):
     stats_changed = Signal(LiveStats)
     config_changed = Signal(Configuration)
     notification_added = Signal(NotificationEntry)
+    metrics_changed = Signal(str, MinerMetrics)
+    log_added = Signal(MinerLogEntry)
 
     def __init__(self) -> None:
         super().__init__()
@@ -84,11 +114,14 @@ class AppState(QObject):
         self.cpu_status = MinerStatus()
         self.gpu_status = MinerStatus()
         self.live_stats = LiveStats()
+        self.config = load_config()
         self.config = Configuration()
         self.notifications: List[NotificationEntry] = []
         self.log_path = Path("duinocoin-gui.log")
         self.logger = logging.getLogger("duinocoin.gui")
         self._configure_logger()
+        self.metrics: dict[str, MinerMetrics] = {"cpu": MinerMetrics(), "gpu": MinerMetrics()}
+        self.logs: List[MinerLogEntry] = []
 
     def set_wallet(self, wallet: WalletData) -> None:
         self.wallet = wallet
@@ -125,10 +158,13 @@ class AppState(QObject):
         self.stats_changed.emit(self.live_stats)
 
     def set_config(self, config: Configuration) -> None:
-        self.config = config
+        self.config = validate_config(config)
+        save_config(self.config)
         self.config_changed.emit(self.config)
 
     def update_config(self, **updates) -> None:
+        updated = replace(self.config, **updates)
+        self.set_config(updated)
         self.config = replace(self.config, **updates)
         self.config_changed.emit(self.config)
 
@@ -171,3 +207,19 @@ class AppState(QObject):
         handler.setFormatter(formatter)
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(handler)
+    def set_metrics(self, miner_type: str, metrics: MinerMetrics) -> None:
+        """Persist metrics for a miner (e.g., 'cpu' or 'gpu') and emit changes."""
+        self.metrics[miner_type] = metrics
+        self.metrics_changed.emit(miner_type, metrics)
+
+    def update_metrics(self, miner_type: str, **updates) -> None:
+        current = self.metrics.get(miner_type, MinerMetrics())
+        self.metrics[miner_type] = replace(current, **updates)
+        self.metrics_changed.emit(miner_type, self.metrics[miner_type])
+
+    def add_log_entry(self, entry: MinerLogEntry, max_entries: int = 100) -> None:
+        """Append a log entry and keep the buffer bounded."""
+        self.logs.append(entry)
+        if len(self.logs) > max_entries:
+            self.logs = self.logs[-max_entries:]
+        self.log_added.emit(entry)

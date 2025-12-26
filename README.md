@@ -15,6 +15,25 @@ This repository packages the official Duino-Coin PC miner script (`PC_Miner.py`)
 
 The miner will prompt for configuration details on first launch and downloads language translations from the upstream Duino-Coin repository as needed.
 
+## GUI dashboard (PySide6)
+The repository includes a PySide6-based GUI preview that surfaces wallet, miner, and live stats in a single window. To set up the GUI:
+
+1. (Recommended) Create a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate  # On Windows use: .venv\\Scripts\\activate
+   ```
+2. Install base miner dependencies and the GUI toolkit:
+   ```bash
+   python3 -m pip install -r requirements.txt -r requirements-gui.txt
+   ```
+   `requirements-gui.txt` isolates the GUI toolkit and Qt runtime bindings (PySide6). Ensure your system has an X11/Wayland session and OpenGL drivers when running the GUI on Linux.
+3. Launch the GUI:
+   ```bash
+   python3 -m gui.main
+   ```
+   The window seeds placeholder data on first launch; future updates can wire it to live miner data.
+
 ## GPU mining
 `GPU_Miner.py` uses the same wallet configuration as the PC miner and supports GPU-specific defaults via an optional `GPU_Settings.cfg` file stored next to `Settings.cfg` in the `Duino-Coin PC Miner 4.3` data directory.
 
@@ -70,4 +89,5 @@ If a prebuilt wheel is not available for your platform (for example, on ARMv6/AR
 ## Project contents
 - `PC_Miner.py` – main PC miner script.
 - `requirements.txt` – Python dependencies used by the miner.
+- `requirements-gui.txt` – PySide6 toolkit/runtime dependencies for the GUI dashboard.
 - `LICENSE` – MIT license covering the release.
