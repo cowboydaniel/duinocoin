@@ -1329,7 +1329,7 @@ class Miner:
         PREFETCH_BACKOFF = 1.0
 
         def _efficiency_from_intensity(intensity: int):
-            if 99 > intensity >= 90:
+            if intensity >= 90:
                 return 0.005
             elif 90 > intensity >= 70:
                 return 0.1
