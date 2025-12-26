@@ -30,6 +30,28 @@ class MinerStatus:
 
 
 @dataclass
+class MinerMetrics:
+    """Normalized metrics derived from miner stdout."""
+
+    hashrate: float = 0.0
+    share_rate_per_min: float = 0.0
+    accepted_shares: int = 0
+    rejected_shares: int = 0
+    rewards_duco: float = 0.0
+    projected_duco_per_day: float = 0.0
+    temperature_c: Optional[float] = None
+    last_error: Optional[str] = None
+
+
+@dataclass
+class MinerLogEntry:
+    """A recent message emitted by the miner processes."""
+
+    level: str
+    message: str
+
+
+@dataclass
 class LiveStats:
     """Aggregated statistics about the mining session."""
 
@@ -61,6 +83,8 @@ class AppState(QObject):
     gpu_status_changed = Signal(MinerStatus)
     stats_changed = Signal(LiveStats)
     config_changed = Signal(Configuration)
+    metrics_changed = Signal(str, MinerMetrics)
+    log_added = Signal(MinerLogEntry)
 
     def __init__(self) -> None:
         super().__init__()
@@ -69,6 +93,8 @@ class AppState(QObject):
         self.gpu_status = MinerStatus()
         self.live_stats = LiveStats()
         self.config = Configuration()
+        self.metrics: dict[str, MinerMetrics] = {"cpu": MinerMetrics(), "gpu": MinerMetrics()}
+        self.logs: List[MinerLogEntry] = []
 
     def set_wallet(self, wallet: WalletData) -> None:
         self.wallet = wallet
@@ -109,3 +135,20 @@ class AppState(QObject):
     def update_config(self, **updates) -> None:
         self.config = replace(self.config, **updates)
         self.config_changed.emit(self.config)
+
+    def set_metrics(self, miner_type: str, metrics: MinerMetrics) -> None:
+        """Persist metrics for a miner (e.g., 'cpu' or 'gpu') and emit changes."""
+        self.metrics[miner_type] = metrics
+        self.metrics_changed.emit(miner_type, metrics)
+
+    def update_metrics(self, miner_type: str, **updates) -> None:
+        current = self.metrics.get(miner_type, MinerMetrics())
+        self.metrics[miner_type] = replace(current, **updates)
+        self.metrics_changed.emit(miner_type, self.metrics[miner_type])
+
+    def add_log_entry(self, entry: MinerLogEntry, max_entries: int = 100) -> None:
+        """Append a log entry and keep the buffer bounded."""
+        self.logs.append(entry)
+        if len(self.logs) > max_entries:
+            self.logs = self.logs[-max_entries:]
+        self.log_added.emit(entry)
