@@ -1059,7 +1059,7 @@ def submit_result(
         + Settings.SEPARATOR
         + f"{hashrate}"
         + Settings.SEPARATOR
-        + f"Official GPU Miner {Settings.VER}"
+        + "Experimental GPU Miner 1.0"
         + Settings.SEPARATOR
         + identifier
         + Settings.SEPARATOR
