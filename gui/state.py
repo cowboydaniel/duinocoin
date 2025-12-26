@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
+
+from .config import Configuration, load_config, save_config, validate_config
 
 
 @dataclass
@@ -92,6 +94,7 @@ class AppState(QObject):
         self.cpu_status = MinerStatus()
         self.gpu_status = MinerStatus()
         self.live_stats = LiveStats()
+        self.config = load_config()
         self.config = Configuration()
         self.metrics: dict[str, MinerMetrics] = {"cpu": MinerMetrics(), "gpu": MinerMetrics()}
         self.logs: List[MinerLogEntry] = []
@@ -129,10 +132,13 @@ class AppState(QObject):
         self.stats_changed.emit(self.live_stats)
 
     def set_config(self, config: Configuration) -> None:
-        self.config = config
+        self.config = validate_config(config)
+        save_config(self.config)
         self.config_changed.emit(self.config)
 
     def update_config(self, **updates) -> None:
+        updated = replace(self.config, **updates)
+        self.set_config(updated)
         self.config = replace(self.config, **updates)
         self.config_changed.emit(self.config)
 

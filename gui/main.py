@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
+from typing import Iterable
 from typing import Callable, Iterable
 
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -11,13 +13,18 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QFrame,
     QListWidgetItem,
@@ -28,6 +35,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .config import Configuration, THEMES, validate_config
+from .state import AppState, LiveStats, MinerStatus, WalletData
 from .metrics import MinerMetricsParser
 from .state import (
     AppState,
@@ -393,62 +402,158 @@ class MinerGaugesPanel(QGroupBox):
 
 
 class SettingsPanel(QGroupBox):
-    """Allows basic configuration updates for the miners."""
+    """Shows configuration summary and opens the settings dialog."""
 
     def __init__(self, state: AppState) -> None:
         super().__init__("Settings")
         self.state = state
 
         layout = QFormLayout()
+        self.cpu_threads_label = QLabel("-")
+        self.intensity_label = QLabel("-")
+        self.server_label = QLabel("-")
+        self.refresh_label = QLabel("-")
+        self.theme_label = QLabel("-")
+        self.auto_start_label = QLabel("-")
 
-        self.cpu_threads = QSpinBox()
-        self.cpu_threads.setMinimum(1)
-        self.cpu_threads.setMaximum(128)
+        self.edit_button = QPushButton("Edit settings")
+        self.edit_button.clicked.connect(self._open_dialog)
 
-        self.intensity = QSpinBox()
-        self.intensity.setMinimum(1)
-        self.intensity.setMaximum(100)
-
-        self.auto_start = QCheckBox("Start miners on launch")
-
-        self.gpu_devices_label = QLabel("-")
-
-        layout.addRow("CPU threads:", self.cpu_threads)
-        layout.addRow("Intensity:", self.intensity)
-        layout.addRow("GPU devices:", self.gpu_devices_label)
-        layout.addRow(self.auto_start)
-
+        layout.addRow("CPU threads:", self.cpu_threads_label)
+        layout.addRow("Intensity:", self.intensity_label)
+        layout.addRow("Server:", self.server_label)
+        layout.addRow("Refresh interval:", self.refresh_label)
+        layout.addRow("Theme:", self.theme_label)
+        layout.addRow("Auto start:", self.auto_start_label)
+        layout.addRow(self.edit_button)
         self.setLayout(layout)
-
-        self.cpu_threads.valueChanged.connect(self._update_threads)
-        self.intensity.valueChanged.connect(self._update_intensity)
-        self.auto_start.stateChanged.connect(self._update_auto_start)
 
         self.state.config_changed.connect(self.refresh)
         self.refresh(self.state.config)
 
-    def _update_threads(self, value: int) -> None:
-        self.state.update_config(cpu_threads=value)
-
-    def _update_intensity(self, value: int) -> None:
-        self.state.update_config(intensity=value)
-
-    def _update_auto_start(self, state: int) -> None:
-        self.state.update_config(auto_start=state == Qt.Checked)
+    def _open_dialog(self) -> None:
+        dialog = SettingsDialog(self.state)
+        dialog.exec()
 
     def refresh(self, config: Configuration) -> None:
-        self.cpu_threads.blockSignals(True)
-        self.intensity.blockSignals(True)
-        self.auto_start.blockSignals(True)
+        self.cpu_threads_label.setText(str(config.cpu_threads))
+        self.intensity_label.setText(str(config.intensity))
+        self.server_label.setText(f"{config.server}:{config.port}")
+        self.refresh_label.setText(f"Every {config.refresh_interval} s")
+        self.theme_label.setText(config.theme.title())
+        self.auto_start_label.setText("Yes" if config.auto_start else "No")
 
-        self.cpu_threads.setValue(config.cpu_threads)
-        self.intensity.setValue(config.intensity)
-        self.auto_start.setChecked(config.auto_start)
-        self.gpu_devices_label.setText(", ".join(config.gpu_devices) or "No devices")
 
-        self.cpu_threads.blockSignals(False)
-        self.intensity.blockSignals(False)
-        self.auto_start.blockSignals(False)
+class SettingsDialog(QDialog):
+    """Dialog for editing miner configuration."""
+
+    def __init__(self, state: AppState) -> None:
+        super().__init__()
+        self.state = state
+        self.setWindowTitle("Settings")
+
+        form = QFormLayout()
+        self.cpu_threads = QSpinBox()
+        self.cpu_threads.setMinimum(1)
+        self.cpu_threads.setMaximum(512)
+        self.cpu_threads.setValue(state.config.cpu_threads)
+
+        self.intensity = QSpinBox()
+        self.intensity.setMinimum(1)
+        self.intensity.setMaximum(100)
+        self.intensity.setValue(state.config.intensity)
+
+        self.server = QLineEdit(state.config.server)
+
+        self.port = QSpinBox()
+        self.port.setMinimum(1)
+        self.port.setMaximum(65535)
+        self.port.setValue(state.config.port)
+
+        self.refresh_interval = QSpinBox()
+        self.refresh_interval.setMinimum(1)
+        self.refresh_interval.setMaximum(3600)
+        self.refresh_interval.setValue(state.config.refresh_interval)
+
+        self.theme = QComboBox()
+        for name in sorted(THEMES):
+            self.theme.addItem(name.title(), name)
+        current_index = self.theme.findData(state.config.theme.lower())
+        self.theme.setCurrentIndex(max(0, current_index))
+
+        self.auto_start = QCheckBox("Start miners on launch")
+        self.auto_start.setChecked(state.config.auto_start)
+
+        self.gpu_devices = QLineEdit(", ".join(state.config.gpu_devices))
+        self.gpu_devices.setPlaceholderText("GPU 0, GPU 1")
+
+        form.addRow("CPU threads:", self.cpu_threads)
+        form.addRow("Intensity:", self.intensity)
+        form.addRow("Server host:", self.server)
+        form.addRow("Port:", self.port)
+        form.addRow("Refresh interval (s):", self.refresh_interval)
+        form.addRow("Theme:", self.theme)
+        form.addRow("GPU devices:", self.gpu_devices)
+        form.addRow(self.auto_start)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._handle_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def _collect_config(self) -> Configuration:
+        devices = [d.strip() for d in self.gpu_devices.text().split(",") if d.strip()]
+        candidate = replace(
+            self.state.config,
+            cpu_threads=self.cpu_threads.value(),
+            intensity=self.intensity.value(),
+            server=self.server.text(),
+            port=self.port.value(),
+            refresh_interval=self.refresh_interval.value(),
+            theme=self.theme.currentData(),
+            auto_start=self.auto_start.isChecked(),
+            gpu_devices=devices,
+        )
+        return validate_config(candidate)
+
+    def _needs_restart(self, new_config: Configuration) -> bool:
+        current = self.state.config
+        return any(
+            [
+                new_config.cpu_threads != current.cpu_threads,
+                new_config.intensity != current.intensity,
+                new_config.server != current.server,
+                new_config.port != current.port,
+            ]
+        )
+
+    def _handle_accept(self) -> None:
+        try:
+            new_config = self._collect_config()
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid settings", str(exc))
+            return
+
+        if self._needs_restart(new_config) and (
+            self.state.cpu_status.running or self.state.gpu_status.running
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Restart required",
+                "Changing threads, intensity, or server requires restarting miners. Stop them now?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer == QMessageBox.No:
+                return
+            self.state.update_cpu_status(running=False, hashrate=0.0)
+            self.state.update_gpu_status(running=False, hashrate=0.0)
+
+        self.state.set_config(new_config)
+        self.accept()
 
 
 class AppWindow(QMainWindow):
@@ -543,6 +648,8 @@ class AppWindow(QMainWindow):
                 username="anonymous", balance=0.0, pending_rewards=0.0
             )
         self.state.update_live_stats(uptime_seconds=0, difficulty=0.0, total_hashes=0)
+        if not self.state.config.gpu_devices:
+            self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
         self.state.update_config(gpu_devices=["GPU 0", "GPU 1"])
         # Warm up gauges with sample miner output.
         sample_lines = [
