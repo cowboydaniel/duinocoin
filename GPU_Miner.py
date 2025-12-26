@@ -504,13 +504,28 @@ class GpuHasher:
         found_nonce = -1
         total_processed = 0
 
+        flag_hosts = [np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32)]
+        nonce_host = np.zeros(1, dtype=np.uint32)
+        pending_result = None
+        copy_wait_event = None
+        buffer_index = 0
+        batch_latencies_ms = []
+
         time_start = time_ns()
         while start_nonce < nonce_limit and found_nonce == -1:
             batch = min(self.batch_size, nonce_limit - start_nonce)
             global_size = self._global_size(batch)
             nonce_count = batch
 
-            cl.enqueue_fill_buffer(self.queue, found_flag_buf, b"\x00\x00\x00\x00", 0, 4)
+            wait_for = [copy_wait_event] if copy_wait_event else None
+            fill_event = cl.enqueue_fill_buffer(
+                self.queue,
+                found_flag_buf,
+                b"\x00\x00\x00\x00",
+                0,
+                4,
+                wait_for=wait_for,
+            )
             self.kernel.set_args(
                 last_buf,
                 np.uint8(len(last_bytes)),
@@ -520,26 +535,78 @@ class GpuHasher:
                 found_nonce_buf,
                 found_flag_buf,
             )
-            cl.enqueue_nd_range_kernel(
+            kernel_event = cl.enqueue_nd_range_kernel(
                 self.queue,
                 self.kernel,
                 (global_size,),
                 (self.work_group_size,),
+                wait_for=[fill_event],
             )
-            self.queue.finish()
+            flag_host = flag_hosts[buffer_index]
+            buffer_index ^= 1
+            copy_event = cl.enqueue_copy(
+                self.queue,
+                flag_host,
+                found_flag_buf,
+                wait_for=[kernel_event],
+                is_blocking=False,
+            )
 
-            flag_host = np.zeros(1, dtype=np.int32)
-            cl.enqueue_copy(self.queue, flag_host, found_flag_buf)
-            found = int(flag_host[0]) != 0
-            if found:
-                nonce_host = np.zeros(1, dtype=np.uint32)
-                cl.enqueue_copy(self.queue, nonce_host, found_nonce_buf)
+            if pending_result:
+                prev_copy, prev_kernel, prev_buffer, prev_batch, prev_start, batch_start_time = pending_result
+                prev_copy.wait()
+                batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
+                found = int(prev_buffer[0]) != 0
+                if found:
+                    nonce_event = cl.enqueue_copy(
+                        self.queue,
+                        nonce_host,
+                        found_nonce_buf,
+                        wait_for=[prev_kernel],
+                        is_blocking=False,
+                    )
+                    nonce_event.wait()
+                    found_nonce = int(nonce_host[0])
+                    total_processed = found_nonce + 1
+                    break
+
+                total_processed = prev_start + prev_batch
+
+            pending_result = (
+                copy_event,
+                kernel_event,
+                flag_host,
+                batch,
+                start_nonce,
+                time_ns(),
+            )
+            copy_wait_event = copy_event
+            start_nonce += batch
+
+        if found_nonce == -1 and pending_result:
+            prev_copy, prev_kernel, prev_buffer, prev_batch, prev_start, batch_start_time = pending_result
+            prev_copy.wait()
+            batch_latencies_ms.append((time_ns() - batch_start_time) / 1e6)
+            if int(prev_buffer[0]) != 0:
+                nonce_event = cl.enqueue_copy(
+                    self.queue,
+                    nonce_host,
+                    found_nonce_buf,
+                    wait_for=[prev_kernel],
+                    is_blocking=False,
+                )
+                nonce_event.wait()
                 found_nonce = int(nonce_host[0])
                 total_processed = found_nonce + 1
-                break
+            else:
+                total_processed = max(total_processed, prev_start + prev_batch)
 
-            start_nonce += batch
-            total_processed = start_nonce
+        if batch_latencies_ms:
+            avg_latency = sum(batch_latencies_ms) / len(batch_latencies_ms)
+            print(
+                f"Avg GPU batch latency: {avg_latency:.3f} ms over {len(batch_latencies_ms)} batches",
+                file=sys.stderr,
+            )
 
         elapsed = time_ns() - time_start
         elapsed_seconds = elapsed / 1e9 if elapsed else 0.0
