@@ -1,0 +1,2 @@
+# GUI toolkit and Qt runtime bindings
+PySide6>=6.6
